@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "ask": [
+      "Edit(/check)",
+      "Edit(/pyproject.toml)",
+      "Edit(/.claude/settings.json)",
+      "Edit(/tests/test_check.py)",
+      "Edit(/blocks/**/CARD.md)",
+      "Edit(/doors/**/CARD.md)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PROJECT_DIR}/check\" --hook",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}
