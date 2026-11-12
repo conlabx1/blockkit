@@ -6,17 +6,31 @@
 
 종료 코드: 0 전부 통과, 1 실패 있음(점검을 시작하지 못한 것도 실패다), 2 실패는 없지만 점검하지 못한 항목 있음.
 """
+import os
+import sys
+
+# 프로젝트 폴더에 놓인 파일(subprocess.py 등)이 표준 모듈 대신 불려서 점검을 가로채지 못하게,
+# 다른 모듈을 부르기 전에 이 파일이 놓인 폴더를 모듈 찾는 길에서 뺀다.
+sys.path[:] = [entry for entry in sys.path if os.path.realpath(entry or ".") != os.path.dirname(os.path.realpath(__file__))]
+
 import ast
 import json
-import os
 import re
 import shutil
 import subprocess
-import sys
+import unicodedata
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+# 링크를 따라가지 않는다. check 가 다른 프로젝트의 것으로 걸린 링크여도, 링크가 놓인 프로젝트를 점검한다.
+HERE = Path(os.path.abspath(__file__))
+ROOT = HERE.parent
 PASS, FAIL, SKIP = "✅", "❌", "⚠️"
+
+
+def clean(text):
+    """화면에 낼 글자에서 줄바꿈과 제어 문자를 물음표로 바꾼다. 파일 이름이나 카드 글자로 「결과:」 줄을 꾸며 낼 수 없게 한다."""
+    kinds = ((char, unicodedata.category(char)) for char in str(text))
+    return "".join("?" if kind in ("Cc", "Cf", "Cs", "Zl", "Zp") else char for char, kind in kinds)
 
 # ---- 바깥쪽 ----
 # 어떤 파이썬으로 불려도, 프로젝트가 고정한 파이썬과 의존성 안에서 점검을 다시 실행한다.
@@ -37,7 +51,7 @@ def find_uv():
 
 def not_started(reason):
     # 점검이 통째로 돌지 못한 상태를 「점검 못 함」으로 두면 그사이의 실패가 가려진다. 그래서 실패로 본다.
-    return 1, "%s 점검: 시작하지 못했습니다. %s\n\n결과: 실패 1개(점검을 시작하지 못했습니다)\n" % (FAIL, reason)
+    return 1, "%s 점검: 시작하지 못했습니다. %s\n\n결과: 실패 1개(점검을 시작하지 못했습니다)\n" % (FAIL, clean(reason))
 
 
 def run_inside():
@@ -45,15 +59,21 @@ def run_inside():
     uv = find_uv()
     if not uv:
         return not_started("uv 를 찾지 못했습니다.")
-    env = dict(os.environ, BLOCKKIT_INSIDE="1", BLOCKKIT_UV=uv, PYTHONUTF8="1")
-    command = [uv, "run", "--frozen", "--quiet", "--project", str(ROOT), "python", str(Path(__file__).resolve())]
+    # --locked: pyproject.toml 과 uv.lock 이 어긋나면 멈춘다. --exact: uv.lock 에 없는 부품을 가상 환경에서 지운다.
+    # 그래서 pyproject.toml 에 적힌 부품과 그 부품이 끌고 오는 부품 말고는 깔려 있을 수 없다.
+    command = [uv, "run", "--locked", "--exact", "--quiet", "--project", str(ROOT), "python", str(HERE), "--inside", uv]
+    env = dict(os.environ, PYTHONUTF8="1")
     try:
         # 훅의 시간 한도(.claude/settings.json 의 300초)보다 먼저 스스로 끝나야 결과를 알릴 수 있다.
-        done = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8", timeout=280)
+        done = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=280)
     except subprocess.TimeoutExpired:
         return not_started("시간 안에 끝나지 않았습니다.")
+    except OSError as error:  # 훅에서는 여기서 죽으면 막지도 알리지도 못한 채 지나간다.
+        return not_started("uv 를 실행하지 못했습니다(%s)." % error)
     # 줄 머리의 「결과:」만 본다. 카드 설명 같은 다른 줄에 섞인 글자를 끝까지 돈 표시로 읽지 않는다.
     if not any(line.startswith("결과:") for line in done.stdout.splitlines()):
+        if "--locked" in done.stderr:
+            return not_started("pyproject.toml 과 uv.lock 이 서로 맞지 않습니다. 에이전트에게 「uv lock 으로 맞춰 줘」라고 말하면 됩니다.")
         return not_started((done.stderr.strip().splitlines() or ["알 수 없는 오류"])[-1].strip())
     return done.returncode, done.stdout
 
@@ -92,7 +112,25 @@ def main_outside(argv):
 # 관문은 규칙을 지키려는 작성자의 실수를 잡는 장치다. 일부러 숨긴 코드를 막는 격리 장치가 아니다.
 
 SECTIONS = ("하는 일", "입력", "출력", "금지 사항")
-SKIP_DIRS = {".git", ".venv", "__pycache__", ".ruff_cache", "node_modules"}
+# 프로젝트 맨 위에 있을 때만 건너뛰는 폴더. 같은 이름이라도 더 안쪽에 있으면 본다(코드를 숨기는 자리가 되지 않게).
+SKIP_DIRS = {".git", ".venv", ".ruff_cache"}
+# 읽고 점검할 수 없는 코드 파일
+COMPILED = (".pyc", ".pyo", ".so", ".pyd")
+# 답을 끝낼 때마다 점검을 돌리는 훅. 명령은 같아도 async 를 더하거나 timeout 을 줄이면 막지 못하므로, 항목 전체가 같아야 한다.
+HOOK = {"type": "command", "command": 'python3 "${CLAUDE_PROJECT_DIR}/check" --hook', "timeout": 300}
+# 틀 자체의 파일. .claude/settings.json 의 permissions.deny 에 있어야 편집 도구와 터미널 명령(>, tee, sed, cp, mv, rm)이 이 파일을 고치지 못한다.
+# 승인만 물으면 「편집 자동 허용」 모드에서 「>」 덧쓰기가 묻지 않고 실행된다. 틀은 이 설정이 적용되지 않는 상위 폴더에서 연 세션에서 고친다.
+DENY_RULES = ("Edit(/check)", "Edit(/tests/test_check.py)", "Edit(/.claude/settings.json)")
+# 주인 승인 없이 바뀌면 안 되는 것들. .claude/settings.json 의 permissions.ask 에 있어야 Claude Code 가 주인에게 묻는다.
+# Bash 규칙: 「편집 자동 허용」 모드는 rm·mv·cp 를 묻지 않고 돌려서, 위의 Edit 규칙을 돌아갈 수 있다.
+# shortcut: 카드처럼 승인만 묻는 파일은 「편집 자동 허용」 모드의 「>」 덧쓰기를 막지 못한다(무늬 규칙은 실제 세션에서 걸리지 않았다), 필요해지면 샌드박스로 막는다.
+ASK_RULES = (
+    "Edit(/pyproject.toml)", "Edit(/uv.lock)", "Edit(/AGENTS.md)", "Edit(/CLAUDE.md)",
+    "Edit(/.claude/**)", "Edit(/.venv/**)", "Edit(/blocks/**/CARD.md)", "Edit(/doors/**/CARD.md)",
+    "Bash(rm *)", "Bash(mv *)", "Bash(cp *)",
+)
+# 형식이 틀린 값이 하나라도 섞이면 Claude Code 가 설정 파일을 통째로 읽지 않는다. 그래서 틀이 정한 내용만 있어야 한다.
+DEVICES = {"permissions": {"deny": list(DENY_RULES), "ask": list(ASK_RULES)}, "hooks": {"Stop": [{"hooks": [HOOK]}]}}
 # 블록은 계산만 한다. 그래서 바깥과 닿지 않는 표준 모듈만 허용한다.
 PURE_MODULES = {
     "__future__", "abc", "base64", "bisect", "calendar", "collections", "copy", "dataclasses", "datetime", "decimal",
@@ -119,6 +157,7 @@ SECRET_PATTERNS = [
 # 시험이 화면에 남긴 글자와 섞이지 않게, 보고는 새 줄에서 시작한다.
 TEST_RUNNER = """
 import json, sys, unittest
+sys.path.insert(0, "")  # 표준 모듈을 먼저 부른 뒤에 프로젝트 폴더를 모듈 찾는 길에 더한다.
 ran = []
 class Recorder(unittest.TestResult):
     def startTest(self, test):
@@ -140,18 +179,28 @@ def units():
     for kind in ("blocks", "doors"):
         base = ROOT / kind
         if base.is_dir():
-            found += [(kind, path) for path in sorted(base.iterdir()) if path.is_dir() and path.name not in SKIP_DIRS]
+            found += [(kind, path) for path in sorted(base.iterdir()) if path.is_dir() and path.name != "__pycache__"]
     return found
 
 
-def project_files():
-    """프로젝트 안의 파일을 돌려준다. 가상 환경과 캐시 폴더는 뺀다."""
+def walk():
+    """프로젝트 폴더를 돌며 (폴더, 하위 폴더 이름들, 파일 이름들) 을 돌려준다. 맨 위의 저장소·가상 환경·캐시 폴더만 뺀다."""
     for folder, dirs, files in os.walk(str(ROOT)):
-        dirs[:] = sorted(name for name in dirs if name not in SKIP_DIRS)
-        for name in sorted(files):
-            path = Path(folder) / name
-            if path.is_file():
-                yield path
+        if folder == str(ROOT):
+            dirs[:] = [name for name in dirs if name not in SKIP_DIRS]
+        elif folder == str(ROOT / ".claude"):
+            # Claude Code 가 여기에 만드는 작업 사본은 프로젝트 전체의 복사본이다. 사본은 그 안의 check 가 점검한다.
+            dirs[:] = [name for name in dirs if name != "worktrees"]
+        dirs.sort()
+        yield Path(folder), dirs, sorted(files)
+
+
+def project_files():
+    """프로젝트 안의 파일을 돌려준다."""
+    for folder, _, files in walk():
+        for name in files:
+            if (folder / name).is_file():
+                yield folder / name
 
 
 def rel(path):
@@ -238,15 +287,25 @@ def gate_cards(all_units):
             if path.stem.endswith("_test"):
                 problems.append("%s: 시험 파일 이름은 test_ 로 시작해야 실행됩니다." % rel(path))
     # 카드도 시험도 없는 자리로 코드가 새 나가는 것을 막는다. 숨김 폴더(.claude 등)는 보지 않는다.
-    for path in project_files():
-        parts = path.relative_to(ROOT).parts
-        if path.suffix != ".py" or parts[0].startswith("."):
-            continue
-        in_unit = parts[0] in ("blocks", "doors") and len(parts) >= 3
-        known = parts in (("app.py",), ("tests", "test_app.py"), ("tests", "test_check.py"))
-        empty_init = path.name == "__init__.py" and len(parts) == 2 and not path.read_bytes().strip()
-        if not (in_unit or known or empty_init):
-            problems.append("%s: 정해진 자리 밖에 놓인 코드 파일입니다. 코드는 블록·통로 폴더나 app.py 에 둡니다." % rel(path))
+    for folder, dirs, files in walk():
+        for name in dirs + files:
+            path = folder / name
+            parts = path.relative_to(ROOT).parts
+            cached = "__pycache__" in parts
+            if parts[0].startswith("."):
+                continue
+            if path.is_symlink():
+                problems.append("%s: 링크입니다. 링크 너머의 코드는 점검이 보지 못하므로 프로젝트에 링크를 두지 않습니다." % rel(path))
+            elif not path.is_file():
+                continue
+            elif path.suffix in COMPILED and not cached:
+                problems.append("%s: 컴파일된 코드 파일입니다. 읽고 점검할 수 없는 코드는 프로젝트에 두지 않습니다." % rel(path))
+            elif path.suffix == ".py":
+                in_unit = parts[0] in ("blocks", "doors") and len(parts) >= 3
+                known = parts in (("app.py",), ("tests", "test_app.py"), ("tests", "test_check.py"))
+                empty_init = path.name == "__init__.py" and len(parts) == 2 and not path.read_bytes().strip()
+                if cached or not (in_unit or known or empty_init):
+                    problems.append("%s: 정해진 자리 밖에 놓인 코드 파일입니다. 코드는 블록·통로 폴더나 app.py 에 둡니다." % rel(path))
     if not (ROOT / "tests" / "test_app.py").is_file():
         problems.append("tests/test_app.py: 조립된 전체를 실제로 돌려 보는 시험이 없습니다.")
     if problems:
@@ -270,9 +329,13 @@ def gate_tests(all_units, executed):
         names.append("tests.test_app")
     if not names:
         return FAIL, "시험이 하나도 없습니다.", []
-    command = [sys.executable, "-c", TEST_RUNNER] + names
+    # -I: 프로젝트 폴더의 파일이 시험 실행기가 쓰는 표준 모듈 행세를 하지 못하게 한다.
+    command = [sys.executable, "-I", "-X", "utf8", "-c", TEST_RUNNER] + names
+    # 시험은 방금 쓰인 코드를 그대로 실행한다. 환경 변수에 든 토큰이 그 코드로 넘어가지 않게, 실행에 필요한 것만 넘긴다.
+    env = {name: os.environ[name] for name in ("PATH", "HOME", "TMPDIR", "LANG") if name in os.environ}
     try:
-        done = subprocess.run(command, cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8", timeout=120)
+        # errors: 시험이 화면에 글자가 아닌 바이트를 써도 관문이 죽지 않게 한다.
+        done = subprocess.run(command, cwd=str(ROOT), env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
     except subprocess.TimeoutExpired:
         return FAIL, "시험이 2분 안에 끝나지 않았습니다.", []
     try:
@@ -393,15 +456,27 @@ def gate_doors(all_units, extra):
 
 
 def gate_patterns(exceptions):
+    # 예외는 프로젝트 안의 파일 하나에 규칙 번호 하나씩만 받는다.
+    # 무늬(*)나 규칙 묶음(S), 쉼표로 이어 붙인 값을 받으면 화면의 「예외 N개」보다 넓게 검사가 꺼진다.
+    wrong = []
+    for name, codes in exceptions.items():
+        if not re.fullmatch(r"[\w./-]+", name) or not (ROOT / name).is_file():
+            wrong.append("「%s」: 프로젝트 안에 있는 파일 하나의 경로를 적습니다." % name)
+        wrong += ["「%s」: 규칙 번호 하나를 적습니다(예: S603)." % code for code in codes if not re.fullmatch(r"[A-Z]+[0-9]{3,4}", code)]
+    if wrong:
+        return FAIL, "pyproject.toml 의 pattern-exceptions 에 받을 수 없는 항목이 %d건 있습니다." % len(wrong), wrong
+    # -I: 프로젝트 폴더의 ruff.py 가 도구 대신 불리지 않게 한다.
     # --isolated: 규칙을 이 파일에만 둔다. ruff.toml 이나 [tool.ruff] 로 검사를 조용히 끌 수 없다.
     # --ignore-noqa: 코드 안의 주석으로 검사를 끌 수 없다. 예외는 pyproject.toml 의 pattern-exceptions 에만 적는다.
-    # --exclude .venv: 기본 제외 목록(dist, venv 등)을 쓰지 않는다. 폴더 이름 때문에 검사에서 빠지는 일이 없다.
-    command = [sys.executable, "-m", "ruff", "check", "--isolated", "--select", PATTERN_RULES, "--ignore-noqa", "--no-cache"]
-    command += ["--quiet", "--no-respect-gitignore", "--exclude", ".venv", "--target-version", "py313", "--output-format", "concise"]
+    command = [sys.executable, "-I", "-m", "ruff", "check", "--isolated", "--select", PATTERN_RULES, "--ignore-noqa", "--no-cache"]
+    command += ["--quiet", "--no-respect-gitignore", "--target-version", "py313", "--output-format", "concise"]
     for pattern, codes in exceptions.items():
         for code in codes:
-            command += ["--per-file-ignores", "%s:%s" % (pattern, code)]
-    done = subprocess.run(command + [".", "check"], cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8", timeout=60)
+            # 「./」를 붙여야 그 파일 하나에만 맞는다. 이름만 넘기면 다른 폴더에 있는 같은 이름의 파일에서도 검사가 꺼진다.
+            command += ["--per-file-ignores", "./%s:%s" % (pattern, code)]
+    # 검사할 파일을 하나씩 직접 넘긴다. 폴더 이름(dist, .venv 등)이나 도구의 기본 제외 목록 때문에 검사에서 빠지는 파일이 없다.
+    targets = [rel(path) for path in project_files() if path.suffix == ".py"] + ["check"]
+    done = subprocess.run(command + ["--"] + targets, cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8", timeout=60)
     if done.returncode == 0:
         return PASS, "위험하거나 틀린 코드 패턴이 없습니다.", []
     if done.returncode != 1:
@@ -419,23 +494,41 @@ def gate_patterns(exceptions):
 def gate_secrets():
     problems = []
     for path in project_files():
-        if path.name == "uv.lock" or path.stat().st_size > 1_000_000:
+        if path == ROOT / "uv.lock":
             continue
-        data = path.read_bytes()
-        if b"\0" in data:
-            continue
-        for number, line in enumerate(data.decode("utf-8", "ignore").splitlines(), 1):
-            for label, pattern in SECRET_PATTERNS:
-                if re.search(pattern, line):
-                    problems.append("%s:%d %s" % (rel(path), number, label))
+        with open(path, "rb") as handle:
+            # 글자 파일만 본다. 첫머리에 0 바이트가 있으면 글자 파일이 아닌 것으로 본다.
+            if b"\0" in handle.read(8192):
+                continue
+            handle.seek(0)
+            for number, raw in enumerate(handle, 1):
+                line = raw.decode("utf-8", "ignore")
+                for label, pattern in SECRET_PATTERNS:
+                    if re.search(pattern, line):
+                        problems.append("%s:%d %s" % (rel(path), number, label))
     if problems:
         return FAIL, "%d건. 비밀 값은 프로젝트 폴더 안에 두지 않습니다." % len(problems), problems
     return PASS, "알려진 형태의 비밀 값은 발견되지 않았습니다.", []
 
 
-def gate_dependencies():
+def gate_devices():
+    """주인에게 알리고 묻는 장치(훅, 승인 규칙)가 설정 파일에 그대로 적혀 있는지 본다. 장치가 빠져도 다른 관문은 통과로 나오기 때문이다."""
+    problems = []
+    for name in ("settings.json", "settings.local.json"):
+        path = ROOT / ".claude" / name
+        settings = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        if settings.get("disableAllHooks"):
+            problems.append(".claude/%s: 훅을 전부 끄는 설정(disableAllHooks)이 있습니다." % name)
+        elif name == "settings.json" and settings != DEVICES:
+            problems.append(".claude/settings.json: 틀이 정한 내용과 다릅니다. 답을 끝낼 때마다 도는 점검 훅, 잠금 규칙 %d개, 승인 규칙 %d개만 적혀 있어야 합니다. 이 파일은 잠겨 있으므로 상위 폴더에서 연 세션에서 되돌리고, 다른 설정은 .claude/settings.local.json 에 적습니다." % (len(DENY_RULES), len(ASK_RULES)))
+    if problems:
+        return FAIL, "%d건" % len(problems), problems
+    return PASS, "답을 끝낼 때마다 도는 점검, 잠금 규칙 %d개, 승인 규칙 %d개가 설정 파일에 그대로 적혀 있습니다." % (len(DENY_RULES), len(ASK_RULES)), []
+
+
+def gate_dependencies(uv):
     # uv audit 는 실험 기능이라 출력과 종료 코드가 바뀔 수 있다. 확실히 읽힌 경우만 통과·실패로 보고 나머지는 「점검 못 함」으로 둔다.
-    command = [os.environ["BLOCKKIT_UV"], "audit", "--frozen", "--preview-features", "audit-command", "--project", str(ROOT)]
+    command = [uv, "audit", "--frozen", "--preview-features", "audit-command", "--project", str(ROOT)]
     try:
         done = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=30)
     except subprocess.TimeoutExpired:
@@ -455,19 +548,24 @@ def describe(all_units, config, extra, exceptions):
     """지금 무엇으로 조립돼 있는지 보여 준다. 숫자가 늘었으면 왜 늘었는지 물어볼 수 있게 한다."""
     for kind, label in (("blocks", "블록"), ("doors", "통로")):
         mine = [unit for unit_kind, unit in all_units if unit_kind == kind]
-        print("%s %d개" % (label, len(mine)))
+        say("%s %d개" % (label, len(mine)))
         for unit in mine:
-            print("  %s: %s" % (unit.name, (read_card(unit).get("하는 일") or ["(카드에 설명이 없습니다)"])[0]))
+            say("  %s: %s" % (unit.name, (read_card(unit).get("하는 일") or ["(카드에 설명이 없습니다)"])[0]))
     groups = config.get("dependency-groups", {}).values()
     specs = config.get("project", {}).get("dependencies", []) + [spec for group in groups for spec in group if isinstance(spec, str)]
     names = sorted({re.split(r"[^A-Za-z0-9._-]", spec.strip(), maxsplit=1)[0] for spec in specs})
-    print("외부 부품 %d개%s" % (len(names), ": " + ", ".join(names) if names else ""))
+    say("외부 부품 %d개%s" % (len(names), ": " + ", ".join(names) if names else ""))
     waived = sum(len(codes) for codes in exceptions.values())
-    print("예외 %d개(추가로 허용한 모듈 %d개, 끈 패턴 검사 %d개)" % (len(extra) + waived, len(extra), waived))
-    print()
+    say("예외 %d개(추가로 허용한 모듈 %d개, 끈 패턴 검사 %d개)" % (len(extra) + waived, len(extra), waived))
+    say()
 
 
-def main_inside():
+def say(text=""):
+    """한 줄을 화면에 낸다. 안쪽의 출력은 전부 여기를 거친다."""
+    print(clean(text))
+
+
+def main_inside(uv):
     import tomllib  # 안쪽은 프로젝트 파이썬(3.13 이상)에서만 돈다.
 
     with open(ROOT / "pyproject.toml", "rb") as handle:
@@ -484,7 +582,8 @@ def main_inside():
         ("통로", lambda: gate_doors(all_units, extra)),
         ("패턴", lambda: gate_patterns(exceptions)),
         ("비밀 값", gate_secrets),
-        ("의존성", gate_dependencies),
+        ("장치", gate_devices),
+        ("의존성", lambda: gate_dependencies(uv)),
     ]
     failed = skipped = 0
     for name, gate in gates:
@@ -494,21 +593,22 @@ def main_inside():
             status, summary, details = FAIL, "점검하다가 오류가 났습니다(%s: %s)." % (type(error).__name__, error), []
         failed += status == FAIL
         skipped += status == SKIP
-        print("%s %s: %s" % (status, name, summary))
+        say("%s %s: %s" % (status, name, summary))
         for line in details:
-            print("     " + line)
-    print()
+            say("     " + line)
+    say()
     if failed:
-        print("결과: 실패 %d개" % failed)
-        print("  에이전트에게 이 결과를 보여 주고 「점검 실패를 고쳐 줘」라고 말하면 됩니다.")
+        say("결과: 실패 %d개" % failed)
+        say("  에이전트에게 이 결과를 보여 주고 「점검 실패를 고쳐 줘」라고 말하면 됩니다.")
         return 1
     if skipped:
-        print("결과: 실패는 없지만 점검하지 못한 항목이 %d개 있습니다." % skipped)
-        print("  인터넷 연결을 확인하고 다시 돌립니다. 그래도 같으면 에이전트에게 이 결과를 보여 줍니다.")
+        say("결과: 실패는 없지만 점검하지 못한 항목이 %d개 있습니다." % skipped)
+        say("  인터넷 연결을 확인하고 다시 돌립니다. 그래도 같으면 에이전트에게 이 결과를 보여 줍니다.")
         return 2
-    print("결과: 전부 통과")
+    say("결과: 전부 통과")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main_inside() if os.environ.get("BLOCKKIT_INSIDE") else main_outside(sys.argv[1:]))
+    # 안쪽은 바깥쪽이 인자로만 부른다. 환경 변수로는 바깥쪽(프로젝트 파이썬으로 다시 부르기, 훅의 차단)을 건너뛰게 할 수 없다.
+    sys.exit(main_inside(sys.argv[2]) if sys.argv[1:2] == ["--inside"] else main_outside(sys.argv[1:]))

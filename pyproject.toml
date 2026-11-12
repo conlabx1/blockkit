@@ -17,6 +17,7 @@ extra-imports = []
 
 [tool.blockkit.pattern-exceptions]
 # "파일" = ["끌 규칙", ...]
+# 프로젝트 안에 있는 파일 하나에 규칙 번호 하나씩만 적는다. 무늬(*)와 규칙 묶음(S)은 점검이 받지 않는다.
 # check 와 그 시험은 고정된 인자로 uv 와 python 을 실행한다.
 "check" = ["S603"]
 "tests/test_check.py" = ["S603"]

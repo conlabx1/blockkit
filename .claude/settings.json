@@ -1,12 +1,22 @@
 {
   "permissions": {
-    "ask": [
+    "deny": [
       "Edit(/check)",
-      "Edit(/pyproject.toml)",
-      "Edit(/.claude/settings.json)",
       "Edit(/tests/test_check.py)",
+      "Edit(/.claude/settings.json)"
+    ],
+    "ask": [
+      "Edit(/pyproject.toml)",
+      "Edit(/uv.lock)",
+      "Edit(/AGENTS.md)",
+      "Edit(/CLAUDE.md)",
+      "Edit(/.claude/**)",
+      "Edit(/.venv/**)",
       "Edit(/blocks/**/CARD.md)",
-      "Edit(/doors/**/CARD.md)"
+      "Edit(/doors/**/CARD.md)",
+      "Bash(rm *)",
+      "Bash(mv *)",
+      "Bash(cp *)"
     ]
   },
   "hooks": {
