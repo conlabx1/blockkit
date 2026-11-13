@@ -1,0 +1,18 @@
+# 워크스페이스. 조립(app)과, 조립에 이어진 블록과 통로를 한데 묶는다.
+# 이 파일에는 [workspace] 만 둔다. [profile], [patch], [workspace.lints] 같은 표는 점검이 받지 않는다.
+# 블록과 통로는 app/Cargo.toml 의 [dependencies] 에 적히면 저절로 워크스페이스에 들어온다. 여기에 따로 적지 않는다.
+# 점검 명령(tools/check)은 이 워크스페이스에 넣지 않는다. 이 파일이 바뀌어도 점검 명령의 부품과 빌드 설정은 그대로다.
+[workspace]
+resolver = "3"
+members = ["app"]
+
+# 아래는 외부 부품과 점검(./check)의 예외를 적는 유일한 자리다. 여기에 더하면 점검이 느슨해지므로, 더한 내용과 이유를 보고에 적는다.
+[workspace.metadata.blockkit]
+# 통로(doors)가 써도 되는 외부 부품(크레이트).
+door-crates = []
+# 블록과 조립(app)도 써도 되는 외부 부품. 계산만 하는 부품만 적는다. 여기에 적으면 통로도 쓸 수 있다.
+extra-crates = []
+
+[workspace.metadata.blockkit.pattern-exceptions]
+# "파일" = ["끌 검사 이름", ...]
+# 프로젝트 안에 있는 파일 하나에 검사 이름 하나씩만 적는다. 무늬(*)와 검사 묶음(clippy::all 등)은 점검이 받지 않는다.

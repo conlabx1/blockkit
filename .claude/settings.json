@@ -2,16 +2,18 @@
   "permissions": {
     "deny": [
       "Edit(/check)",
-      "Edit(/tests/test_check.py)",
-      "Edit(/.claude/settings.json)"
+      "Edit(/tools/check/**)",
+      "Edit(/.claude/settings.json)",
+      "Edit(/rust-toolchain.toml)",
+      "Edit(/rust-toolchain)",
+      "Edit(/.cargo/**)"
     ],
     "ask": [
-      "Edit(/pyproject.toml)",
-      "Edit(/uv.lock)",
+      "Edit(/Cargo.toml)",
+      "Edit(/Cargo.lock)",
       "Edit(/AGENTS.md)",
       "Edit(/CLAUDE.md)",
       "Edit(/.claude/**)",
-      "Edit(/.venv/**)",
       "Edit(/blocks/**/CARD.md)",
       "Edit(/doors/**/CARD.md)",
       "Bash(rm *)",
@@ -25,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PROJECT_DIR}/check\" --hook",
+            "command": "sh \"${CLAUDE_PROJECT_DIR}/check\" --hook",
             "timeout": 300
           }
         ]
