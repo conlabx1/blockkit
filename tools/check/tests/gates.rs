@@ -167,7 +167,7 @@ impl Project {
             project.write(name, text);
         }
         // 실제 설정 파일을 그대로 쓴다. 틀의 설정 파일이 점검 명령이 정한 내용과 어긋나면 이 시험들이 실패한다.
-        for name in [DEVICES, "rust-toolchain.toml"] {
+        for name in [DEVICES, "rust-toolchain.toml", ".codex/hooks.json", ".agents/hooks.json"] {
             project.write(name, &fs::read_to_string(real(name)).unwrap());
         }
         assert!(project.lock(true));
@@ -260,6 +260,26 @@ fn 깨끗한_프로젝트는_실패가_없다() {
     assert!(output.contains("✅ 시험: 4개 통과"), "{output}");
     assert!(output.contains("⚠️ 의존성") && output.contains("인터넷"), "{output}");
     assert!(output.starts_with("블록 1개\n  sample: 글자를 대문자로 바꾼다.\n통로 0개\n외부 부품 0개\n예외 0개("), "{output}");
+}
+
+#[test]
+fn 점검이_돌_때마다_그림_페이지가_지금_결과로_바뀐다() {
+    let project = Project::new();
+    project.passes();
+    let page = project.read("target/check.html");
+    assert!(page.contains(r#"class="verdict skip""#), "{page}");
+    assert!(page.contains(r#"class="brick name ok" data-unit="blocks/sample""#), "{page}");
+    assert!(page.contains(r#"class="brick ok" data-id="N1""#), "{page}");
+    project.edit(BLOCK, "fn n1_빈_글자는_받지_않는다", "fn 빈_글자는_받지_않는다");
+    project.fails("금지 연결", &["blocks/sample: 금지 사항 [N1] 을 확인하는 시험이 없습니다."]);
+    let page = project.read("target/check.html");
+    assert!(page.contains(r#"class="verdict fail""#), "{page}");
+    assert!(page.contains(r#"class="brick name fail" data-unit="blocks/sample""#), "{page}");
+    assert!(page.contains(r#"class="brick fail" data-id="N1""#), "{page}");
+    assert!(page.contains(r#"class="brick ok" data-id="N2""#), "{page}");
+    project.remove("target/check.html");
+    assert_eq!(project.hook("{}")["decision"], "block");
+    assert!(project.read("target/check.html").contains(r#"class="brick fail" data-id="N1""#));
 }
 
 #[test]
@@ -866,7 +886,16 @@ fn 훅이나_잠금_승인_규칙이_빠지면_실패한다() {
     let settings: Value = serde_json::from_str(&project.read(DEVICES)).unwrap();
     assert!(project.passes().contains("✅ 장치"));
     // 틀 자체의 파일은 승인을 묻는 것이 아니라 잠겨 있어야 한다. 승인만 물으면 「>」 덧쓰기가 묻지 않고 실행된다.
-    let locked = ["Edit(/check)", "Edit(/tools/check/**)", "Edit(/.claude/settings.json)", "Edit(/rust-toolchain.toml)", "Edit(/rust-toolchain)", "Edit(/.cargo/**)"];
+    let locked = [
+        "Edit(/check)",
+        "Edit(/tools/check/**)",
+        "Edit(/.claude/settings.json)",
+        "Edit(/rust-toolchain.toml)",
+        "Edit(/rust-toolchain)",
+        "Edit(/.cargo/**)",
+        "Edit(/.codex/**)",
+        "Edit(/.agents/hooks.json)",
+    ];
     assert_eq!(settings["permissions"]["deny"], json!(locked));
     let with = |pointer: &str, value: Value| {
         let mut changed = settings.clone();
@@ -894,7 +923,7 @@ fn 훅이나_잠금_승인_규칙이_빠지면_실패한다() {
     let mut other = settings.clone();
     other["cleanupPeriodDays"] = json!("many");
     broken.push(other);
-    assert_eq!(broken.len(), 21);
+    assert_eq!(broken.len(), 23);
     for changed in broken {
         project.write(DEVICES, &changed.to_string());
         project.fails("장치", &[".claude/settings.json: 틀이 정한 내용과 다릅니다."]);
@@ -912,6 +941,33 @@ fn 훅을_끄는_설정이_있으면_실패한다() {
     project.passes();
     project.write(".claude/settings.local.json", "{\"disableAllHooks\": true}");
     project.fails("장치", &[".claude/settings.local.json: 훅을 전부 끄는 설정(disableAllHooks)이 있습니다."]);
+}
+
+#[test]
+fn 다른_하네스의_훅_설정이_빠지거나_바뀌거나_꺼지면_실패한다() {
+    let project = Project::new();
+    project.write(".codex/config.toml", "model = \"gpt-6.2-sol\"\n[features]\nweb_search = false\n");
+    project.passes();
+    for (name, key) in [(".codex/hooks.json", "/hooks/Stop/0/hooks/0"), (".agents/hooks.json", "/blockkit/PreToolUse/0/hooks/0")] {
+        let original = project.read(name);
+        let settings: Value = serde_json::from_str(&original).unwrap();
+        let mut weakened = settings.clone();
+        weakened.pointer_mut(key).unwrap()["timeout"] = json!(5);
+        let mut removed = settings.clone();
+        removed.as_object_mut().unwrap().clear();
+        for changed in [weakened.to_string(), removed.to_string(), "{".to_string()] {
+            project.write(name, &changed);
+            project.fails("장치", &[&format!("{name}: 틀이 정한 내용과 다릅니다.")]);
+        }
+        project.remove(name);
+        project.fails("장치", &[&format!("{name}: 틀이 정한 내용과 다릅니다.")]);
+        project.write(name, &original);
+    }
+    project.passes();
+    for config in ["[features]\nhooks = false\n", "[features]\ncodex_hooks = false\n"] {
+        project.write(".codex/config.toml", config);
+        project.fails("장치", &[".codex/config.toml: 훅을 끄는 설정(features.hooks = false)이 있습니다."]);
+    }
 }
 
 #[test]
@@ -1018,6 +1074,8 @@ fn 예외를_적는_설정을_읽지_못하면_시작하지_못한_것으로_보
         let (code, output) = project.check();
         assert_eq!(code, 1, "{output}");
         assert!(output.starts_with("❌ 점검: 시작하지 못했습니다.") && output.ends_with("결과: 실패 1개(점검을 시작하지 못했습니다)\n"), "{output}");
+        let page = project.read("target/check.html");
+        assert!(page.contains(r#"class="verdict fail"><h1>결과: 실패 1개(점검을 시작하지 못했습니다)</h1>"#) && page.contains("Cargo.toml"), "{page}");
         assert_eq!(project.hook("{}")["decision"], "block");
     }
     let (code, output) = output_of(Command::new(env!("CARGO_BIN_EXE_check")), "");
@@ -1080,6 +1138,21 @@ fn 멈춘_훅은_시간_한도에서_막는_답을_내고_끝난다() {
     assert!(reply["reason"].as_str().unwrap().contains("시작하지 못했습니다. 시간 안에 끝나지 않았습니다."), "{reply}");
 }
 
+#[test]
+fn 멈춘_점검은_그림도_실패_페이지로_바꾼다() {
+    let project = Project::new();
+    project.passes();
+    assert!(project.read("target/check.html").contains(r#"class="verdict skip""#));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_check"));
+    let mut child = command.args(["--hook", "--limit", "1", "--root"]).arg(&project.root).env("PATH", path()).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let held_open = child.stdin.take();
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    drop(held_open);
+    let page = project.read("target/check.html");
+    assert!(page.contains(r#"class="verdict fail""#) && page.contains(r#"<svg class="roof open""#), "{page}");
+    assert!(page.contains("시간 안에 끝나지 않았습니다."), "{page}");
+}
+
 // ---- 실행기(check) ----
 
 /// 실행기를 가짜 cargo 와 함께 임시 폴더에 놓는다. 가짜 cargo 는 받은 것을 적어 두고, 정해 준 대로 답한다.
@@ -1114,7 +1187,7 @@ impl Launcher {
 
     fn run_with_path(&self, args: &[&str], stdin: &str, path: &str) -> (i32, String) {
         let mut command = Command::new("/bin/sh");
-        command.arg(self.root().join("check")).args(args).current_dir(&self.dir).env_clear().env("HOME", &self.dir).env("PATH", path);
+        command.arg(self.root().join("check")).args(args).current_dir(&self.dir).env_clear().env("HOME", &self.dir).env("PATH", path).env("TMPDIR", &self.dir);
         // 표준 오류도 닫힐 때까지 읽어서 stderr 파일에 남긴다. 남은 프로세스가 출력을 쥐고 있으면 여기서 기다리게 된다.
         let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
@@ -1212,6 +1285,64 @@ fn 실행기는_점검_명령이_죽거나_끝까지_돌지_못하면_시작_실
     let launcher = Launcher::new("printf '결과: 전부 통과\\n'");
     let (_, reply) = launcher.run(&["--hook"], "{}");
     assert_eq!(serde_json::from_str::<Value>(&reply).unwrap()["decision"], "block");
+}
+
+#[test]
+fn 실행기는_점검을_시작하지_못하면_하네스마다_그_하네스의_말로_한_번만_막는다() {
+    let launcher = Launcher::new("exit 101");
+    let answer = |args: &[&str], input: &str| -> Value {
+        let (code, reply) = launcher.run(args, input);
+        assert_eq!(code, 0, "{reply}");
+        serde_json::from_str(&reply).unwrap()
+    };
+    for (args, first, again) in [
+        (vec!["--hook", "codex"], "{\"stop_hook_active\": false}", "{\"stop_hook_active\": true}"),
+        (vec!["--hook", "hermes"], "{\"hook_event_name\": \"pre_verify\", \"extra\": {\"attempt\": 0}}", "{\"hook_event_name\": \"pre_verify\", \"extra\": {\"attempt\": 2}}"),
+        (vec!["--hook", "hermes"], "{\"stop_hook_active\": true, \"extra\": {\"attempt\": 0}}", "{\"extra\": {\"attempt\":1}}"),
+    ] {
+        let reply = answer(&args, first);
+        assert_eq!(reply["decision"], "block", "{args:?} {first}");
+        assert!(reply["reason"].as_str().unwrap().contains("시작하지 못했습니다"), "{reply}");
+        assert_eq!(answer(&args, again), json!({"systemMessage": "점검(./check) 결과: 실패 1개(점검을 시작하지 못했습니다)"}), "{args:?} {again}");
+    }
+    let antigravity = ["--hook", "antigravity"];
+    let input = |id: &str| json!({"conversationId": id, "lastUserInput": "만들어 줘", "executionNum": 1, "terminationReason": "model_stop", "fullyIdle": true}).to_string();
+    let reply = answer(&antigravity, &input("c-1"));
+    assert_eq!(reply["decision"], "continue", "{reply}");
+    assert!(reply["reason"].as_str().unwrap().contains("시작하지 못했습니다"), "{reply}");
+    let stopped = json!({"decision": "stop", "reason": "점검(./check) 결과: 실패 1개(점검을 시작하지 못했습니다)"});
+    assert_eq!(answer(&antigravity, &input("c-1")), stopped);
+    assert_eq!(answer(&antigravity, &input("c-2"))["decision"], "continue");
+    assert_eq!(answer(&antigravity, &input("c_4"))["decision"], "continue");
+    for input in ["{}", "", "{\"conversationId\": \"../x\"}", "{\"conversationId\": \"c-3\", \"terminationReason\": \"error\", \"fullyIdle\": true}", "{\"conversationId\": \"c-3\", \"terminationReason\": \"model_stop\", \"fullyIdle\": false}"] {
+        assert_eq!(answer(&antigravity, input), stopped, "{input}");
+    }
+    assert_eq!(answer(&antigravity, &input("c-3"))["decision"], "continue");
+    for dialect in ["codex", "hermes", "antigravity"] {
+        assert_eq!(launcher.run(&["--guard", dialect], "{\"tool_name\": \"Bash\"}"), (0, String::new()), "{dialect}");
+    }
+}
+
+#[test]
+fn 실행기가_점검을_시작하지_못하면_그림_페이지도_실패로_바꾸고_지킴이는_페이지를_쓰지_않는다() {
+    let launcher = Launcher::new("exit 101");
+    let page = launcher.root().join("target/check.html");
+    assert_eq!(launcher.run(&["--guard", "codex"], "{}").0, 0);
+    assert!(!page.exists());
+    assert_eq!(launcher.run(&[], "").0, 1);
+    let text = fs::read_to_string(&page).unwrap();
+    assert!(text.contains("점검을 시작하지 못했습니다") && text.contains("빌드하거나 실행하지 못했습니다"), "{text}");
+}
+
+#[test]
+fn 실행기는_지킴이의_답을_그대로_전하고_답이_없으면_아무것도_내지_않는다() {
+    let deny = r#"{"decision":"deny","reason":"막음"}"#;
+    let launcher = Launcher::new(&format!("printf '%s' '{deny}'"));
+    assert_eq!(launcher.run(&["--guard", "antigravity"], "{}"), (0, format!("{deny}\n")));
+    assert!(launcher.recorded("args").contains("--guard\nantigravity"), "{}", launcher.recorded("args"));
+    assert_eq!(launcher.recorded("stdin"), "{}");
+    let launcher = Launcher::new("exit 0");
+    assert_eq!(launcher.run(&["--guard", "codex"], "{}"), (0, String::new()));
 }
 
 #[test]

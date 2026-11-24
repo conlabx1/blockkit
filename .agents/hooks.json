@@ -1,0 +1,23 @@
+{
+  "blockkit": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "sh -c 'd=$(pwd); while [ ! -f \"$d/check\" ] || [ ! -d \"$d/tools/check\" ]; do [ \"$d\" = / ] && exit 0; d=$(dirname \"$d\"); done; exec sh \"$d/check\" --hook antigravity'",
+        "timeout": 300
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'd=$(pwd); while [ ! -f \"$d/check\" ] || [ ! -d \"$d/tools/check\" ]; do [ \"$d\" = / ] && exit 0; d=$(dirname \"$d\"); done; exec sh \"$d/check\" --guard antigravity'",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

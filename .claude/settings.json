@@ -6,7 +6,9 @@
       "Edit(/.claude/settings.json)",
       "Edit(/rust-toolchain.toml)",
       "Edit(/rust-toolchain)",
-      "Edit(/.cargo/**)"
+      "Edit(/.cargo/**)",
+      "Edit(/.codex/**)",
+      "Edit(/.agents/hooks.json)"
     ],
     "ask": [
       "Edit(/Cargo.toml)",

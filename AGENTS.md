@@ -52,7 +52,7 @@
 - 점검은 시험을 하나씩 따로 실행한다. 시험 하나는 60초 안에 끝나야 한다. 작업 폴더는 그 블록의 폴더다.
 - 점검 전체는 240초, 시험 빌드는 150초, 패턴 검사는 90초 안에 끝나야 한다. 외부 부품을 처음 빌드하느라 한도를 넘겨서 실패가 나왔으면 한 번 더 돌린다.
 - 답을 끝낼 때 도는 점검(훅)은 점검 명령 자체를 빌드하는 데 30초까지만 쓴다. 「30초 안에 빌드하지 못했습니다」 로 막히면 터미널에서 `./check` 를 한 번 돌린다. 터미널에서는 빌드에 한도가 없다. 「빌드하지 못했습니다」 로 막히면 다시 돌려도 풀리지 않으므로, 터미널에서 `./check` 를 돌려 빌드 오류를 확인하고 주인에게 알린다.
-- 샌드박스가 켜진 세션에서는 직접 돌린 `./check` 가 「Operation not permitted」 와 함께 「시작하지 못했습니다」 로 끝날 수 있다. 잠긴 폴더(`tools/check/`) 아래에 빌드 결과를 쓰지 못해서이고, 점검 장치가 고장 난 것이 아니다. 고치려 하지 말고, 직접 돌린 점검이 샌드박스에 막혔다고 주인에게 알린다. 답을 끝낼 때 도는 점검은 샌드박스 밖에서 돌고, 실패가 있으면 그 내용이 전달된다.
+- 샌드박스가 켜진 세션에서는 직접 돌린 `./check` 가 「Operation not permitted」 와 함께 「시작하지 못했습니다」 로 끝날 수 있다. 잠긴 폴더(`tools/check/`) 아래에 빌드 결과를 쓰지 못해서이고, 점검 장치가 고장 난 것이 아니다. 고치려 하지 말고, 직접 돌린 점검이 샌드박스에 막혔다고 주인에게 알린다. Claude Code 에서는 답을 끝낼 때 도는 점검이 샌드박스 밖에서 돌고, 실패가 있으면 그 내용이 전달된다.
 - 점검이 시험을 돌릴 때는 환경 변수를 `PATH`, `HOME`, `TMPDIR`, `LANG` 만 넘긴다. 시험이 다른 환경 변수에 기대지 않게 쓴다. 빌드 도구가 실행 시점에 넣어 주는 `CARGO_MANIFEST_DIR` 같은 변수도 없다(컴파일할 때 읽는 `env!("CARGO_BIN_EXE_app")` 은 `tests/` 에서 쓸 수 있다).
 - 문서 주석 안의 예제(문서 시험)는 점검이 돌리지 않는다. 약속은 `#[test]` 시험으로 적는다.
 
@@ -78,9 +78,9 @@
 - 승인받은 외부 부품은 맨 위 `Cargo.toml` 에 먼저 적는다. 통로만 쓰는 부품은 `door-crates` 에, 블록과 조립도 쓰는 부품은 `extra-crates` 에 적는다. `extra-crates` 에 적은 부품은 모든 블록과 조립, 통로에서 함께 허용되므로, 승인을 구할 때 이 점을 같이 말한다. `extra-crates` 에는 계산만 하는 부품만 적는다.
 - 외부 부품은 쓰는 블록이나 통로의 `Cargo.toml` 에 버전으로만 적는다(`이름 = "1.2"` 또는 `{ version, features, default-features }`). `path`, `git`, 이름을 바꾸는 `package` 는 점검이 받지 않는다.
 - 블록·통로·조립의 `Cargo.toml` 에는 `[package]`(`name`, `version`, `edition`, `publish`, `description`), `[dependencies]`, `[dev-dependencies]` 만 둔다. `build`, `[lib]`, `[features]`, `[lints]`, `[profile]`, `[patch]` 같은 항목은 빌드되는 코드나 도는 시험, 검사를 바꾸므로 점검이 받지 않는다.
-- 틀 자체의 파일은 이 폴더에서 고칠 수 없게 잠겨 있다: `check`, `tools/check/` 안의 모든 파일, `.claude/settings.json`, `rust-toolchain.toml`. 있으면 안 되는 `rust-toolchain` 파일과 `.cargo/` 폴더도 만들 수 없게 잠겨 있다. 이 파일을 고쳐야 할 것 같으면 고치려 하지 말고 주인에게 알린다. 틀은 상위 폴더에서 연 세션에서 고친다.
-- 아래 파일은 편집할 때 주인에게 승인을 묻게 돼 있다: 맨 위의 `Cargo.toml` 과 `Cargo.lock`, `AGENTS.md`, `CLAUDE.md`, 카드(`CARD.md`), `.claude/` 안의 파일. `rm`, `mv`, `cp` 명령도 주인에게 묻는다. `>` 로 덧쓰기 같은 다른 터미널 명령이나 스크립트로 돌아서 고치지 않는다.
-- `.claude/settings.json` 에는 틀이 정한 훅과 잠금·승인 규칙만 있어야 한다. 형식이 틀린 값이 하나라도 섞이면 Claude Code 가 이 파일을 통째로 읽지 않아서 훅과 승인 규칙이 함께 꺼진다. 다른 설정이 필요하면 `.claude/settings.local.json` 에 적는다.
+- 틀 자체의 파일은 이 폴더에서 고치지 않는다: `check`, `tools/check/` 안의 모든 파일, `.claude/settings.json`, `rust-toolchain.toml`, `.codex/` 안의 파일, `.agents/hooks.json`. 있으면 안 되는 `rust-toolchain` 파일과 `.cargo/` 폴더도 만들지 않는다. Claude Code 에서는 잠금 규칙이 막고, Codex·Antigravity·Hermes 에서는 도구를 쓰기 직전에 도는 지킴이(`./check --guard`)가 막는다. 지킴이는 명령의 글자만 읽으므로 모든 길을 막지는 못한다. 막히지 않았다고 고쳐도 되는 것은 아니다. 지킴이는 `tools/check/` 처럼 잠긴 자리의 경로가 든 명령이면 읽기만 하는 명령도 막는다. 이 파일을 고쳐야 할 것 같으면 고치려 하지 말고 주인에게 알린다. 틀은 상위 폴더에서 연 세션에서 고친다.
+- 아래 파일은 편집할 때 주인에게 승인을 묻게 돼 있다: 맨 위의 `Cargo.toml` 과 `Cargo.lock`, `AGENTS.md`, `CLAUDE.md`, 카드(`CARD.md`), `.claude/` 안의 파일. `rm`, `mv`, `cp` 명령도 주인에게 묻는다. `>` 로 덧쓰기 같은 다른 터미널 명령이나 스크립트로 돌아서 고치지 않는다. 이 승인 질문은 Claude Code 에만 있다. 다른 하네스에서는 이 파일을 고치거나 `rm`, `mv`, `cp` 를 쓰기 전에 주인에게 먼저 묻는다.
+- `.claude/settings.json` 에는 틀이 정한 훅과 잠금·승인 규칙만 있어야 한다. 형식이 틀린 값이 하나라도 섞이면 Claude Code 가 이 파일을 통째로 읽지 않아서 훅과 승인 규칙이 함께 꺼진다. 다른 설정이 필요하면 `.claude/settings.local.json` 에 적는다. `.codex/hooks.json` 과 `.agents/hooks.json` 도 틀이 정한 내용 그대로여야 한다.
 - 패턴 검사는 코드 안의 `#[allow(…)]`·`#[expect(…)]`·`#[warn(…)]`, `clippy.toml`, `.cargo/config.toml`, `[lints]` 로 끄거나 낮출 수 없다. 꼭 필요한 예외는 맨 위 `Cargo.toml` 의 `[workspace.metadata.blockkit.pattern-exceptions]` 에 적고, 무엇을 왜 적었는지 보고한다. 예외는 프로젝트 안의 파일 하나에 검사 이름 하나씩만 적을 수 있다. 무늬(`*`)와 검사 묶음(`clippy::all`, `warnings` 등)은 점검이 받지 않는다. 예외를 적은 파일에는 `mod 이름;` 선언을 둘 수 없다.
 - 조건에 따라 코드를 빼는 표시는 `#[cfg(test)]` 만 쓴다. `#[cfg(feature = "…")]`, `#[cfg(target_os = "…")]`, `#[cfg_attr(…)]` 는 코드를 검사와 시험에서 빠지게 하므로 점검이 받지 않는다.
 - `#[cfg(test)]` 는 시험 모듈(`mod tests`) 바로 앞에만 붙인다. 함수나 문장에 붙이거나 `cfg!(…)`·`cfg_select!` 를 쓰면 시험할 때와 실제로 돌 때의 코드가 달라져서, 시험할 때만 금지 사항을 지키는 코드가 된다. 점검이 받지 않는다.

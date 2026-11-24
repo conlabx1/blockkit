@@ -1,20 +1,24 @@
 //! 블록 조립 규칙을 지켰는지 점검한다. 맨 위의 `check` 실행기가 이 프로그램을 빌드해서 부른다.
 //!
-//! 사용법: check --root <프로젝트 폴더> [--hook] [--offline] [--limit <초>]
-//!   --hook     Claude Code 의 Stop 훅이 읽는 JSON 한 줄을 내고 항상 0 으로 끝난다(훅에서는 종료 코드 2 가 차단으로 읽힌다).
+//! 사용법: check --root <프로젝트 폴더> [--hook [codex|hermes|antigravity]] [--guard <codex|hermes|antigravity>] [--offline] [--limit <초>]
+//!   --hook     답을 끝낼 때 도는 훅이 읽는 JSON 한 줄을 내고 항상 0 으로 끝난다(훅에서는 종료 코드 2 가 차단으로 읽힌다). 이름이 없으면 Claude Code 의 말로 낸다.
+//!   --guard    도구를 쓰기 직전에 도는 훅으로 쓴다. 틀 파일을 고치는 호출이면 막는 JSON 한 줄을 내고, 아니면 아무것도 내지 않는다.
 //!   --offline  인터넷을 쓰지 않는다. 의존성 관문은 「점검 못 함」으로 남는다.
 //!   --limit    점검 전체에 쓸 시간(기본 240초). 넘기면 그 뒤에 도구를 불러야 하는 관문은 실패로 끝나고, 의존성 관문만 「점검 못 함」으로 남는다.
 //!
 //! 종료 코드: 0 전부 통과, 1 실패 있음(점검을 시작하지 못한 것도 실패다), 2 실패는 없지만 점검하지 못한 항목 있음.
 
 mod gates;
+mod guard;
+mod picture;
 mod run;
 mod scan;
 
-use gates::{FAIL, Project, SKIP};
+use gates::{FAIL, Gate, Project, SKIP};
 use serde_json::{Value, json};
+use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::thread;
@@ -64,6 +68,12 @@ fn not_started(reason: &str) -> (u8, String) {
     (1, format!("{FAIL} 점검: 시작하지 못했습니다. {}\n\n결과: 실패 1개(점검을 시작하지 못했습니다)\n", clean(reason)))
 }
 
+fn stopped(root: &Path, reason: &str) -> (u8, String) {
+    let stopped = not_started(reason);
+    picture::save(root, &[], &[("점검", Gate { status: FAIL, summary: "시작하지 못했습니다".to_string(), details: vec![clean(reason)] })], stopped.0, &stopped.1);
+    stopped
+}
+
 /// 지금 무엇으로 조립돼 있는지 보여 준다. 숫자가 늘었으면 왜 늘었는지 물어볼 수 있게 한다.
 fn describe(project: &Project, out: &mut String) {
     for (kind, label) in [("blocks", "블록"), ("doors", "통로")] {
@@ -86,7 +96,7 @@ fn describe(project: &Project, out: &mut String) {
 fn check(root: &Path, offline: bool, limit: Duration) -> (u8, String) {
     let project = match Project::load(root, offline, limit) {
         Ok(project) => project,
-        Err(reason) => return not_started(&reason),
+        Err(reason) => return stopped(root, &reason),
     };
     let mut out = String::new();
     describe(&project, &mut out);
@@ -111,7 +121,7 @@ fn check(root: &Path, offline: bool, limit: Duration) -> (u8, String) {
     say(&mut out, "");
     let count = |status: &str| results.iter().filter(|(_, gate)| gate.status == status).count();
     let (failed, skipped) = (count(FAIL), count(SKIP));
-    if failed > 0 {
+    let finished = if failed > 0 {
         say(&mut out, &format!("결과: 실패 {failed}개"));
         say(&mut out, "  에이전트에게 이 결과를 보여 주고 「점검 실패를 고쳐 줘」라고 말하면 됩니다.");
         (1, out)
@@ -122,33 +132,99 @@ fn check(root: &Path, offline: bool, limit: Duration) -> (u8, String) {
     } else {
         say(&mut out, "결과: 전부 통과");
         (0, out)
-    }
+    };
+    picture::save(root, &picture::bricks(&project), &results, finished.0, &finished.1);
+    finished
 }
 
-/// Stop 훅의 답을 만든다. `input` 은 Claude Code 가 훅에 넘겨 준 JSON 이다.
-fn hook_reply(input: &str, output: &str) -> String {
-    let active = serde_json::from_str::<Value>(input).is_ok_and(|data| data["stop_hook_active"] == true);
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Harness {
+    Claude,
+    Codex,
+    Hermes,
+    Antigravity,
+}
+
+fn harness_of(args: &[String]) -> Option<Harness> {
+    let at = args.iter().position(|arg| arg == "--hook")?;
+    Some(match args.get(at + 1).map(String::as_str) {
+        Some("codex") => Harness::Codex,
+        Some("hermes") => Harness::Hermes,
+        Some("antigravity") => Harness::Antigravity,
+        _ => Harness::Claude,
+    })
+}
+
+const CONTINUES: u32 = 3;
+
+fn mark_of(data: &Value, marks: &Path) -> Option<PathBuf> {
+    let id: String = data["conversationId"].as_str().unwrap_or_default().chars().filter(|letter| letter.is_ascii_alphanumeric() || *letter == '-' || *letter == '_').collect();
+    (!id.is_empty()).then(|| marks.join(id))
+}
+
+fn marks_in(tmp: Option<std::ffi::OsString>) -> PathBuf {
+    tmp.filter(|dir| !dir.is_empty()).map_or_else(|| PathBuf::from("/tmp"), PathBuf::from).join("blockkit-hook")
+}
+
+const MARKER: &str = "점검(./check)에 실패가 있습니다.";
+
+fn first_stop(data: &Value, output: &str, marks: &Path) -> bool {
+    let Some(mark) = mark_of(data, marks) else { return false };
+    let said = data["lastUserInput"].as_str().unwrap_or_default();
+    let previous: Value = fs::read_to_string(&mark).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or(Value::Null);
+    let ours = said.contains(MARKER);
+    let fresh = previous.is_null() || (previous["turn"] != said && !ours);
+    let count = if fresh { 0 } else { previous["count"].as_u64().unwrap_or(u64::from(CONTINUES)) };
+    let last = if fresh { "" } else { previous["output"].as_str().unwrap_or_default() };
+    let turn = if ours && !fresh { previous["turn"].clone() } else { json!(said) };
+    data["terminationReason"] == "model_stop"
+        && data["fullyIdle"] == true
+        && last != output
+        && count < u64::from(CONTINUES)
+        && fs::create_dir_all(marks).is_ok()
+        && fs::write(&mark, json!({"count": count + 1, "turn": turn, "output": output}).to_string()).is_ok()
+}
+
+/// 답을 끝낼 때 도는 훅의 답을 만든다. `input` 은 하네스가 훅에 넘겨 준 JSON 이다.
+fn hook_reply(harness: Harness, input: &str, output: &str, marks: &Path) -> String {
+    let data = serde_json::from_str::<Value>(input).unwrap_or(Value::Null);
     // 줄 머리의 「결과:」만 본다. 카드 설명 같은 다른 줄에 섞인 글자를 결과로 읽지 않는다.
     let verdict = output.lines().find(|line| line.starts_with("결과:")).unwrap_or(output.trim());
-    // 매번 한 줄을 화면에 보여 준다. 이 줄이 안 보이면 훅이 돌지 않은 것이다.
-    let mut reply = json!({"systemMessage": format!("점검(./check) {verdict}")});
+    let summary = format!("점검(./check) {verdict}");
     // 의존성 실패는 방금 고친 것과 무관하게 새 취약점 공개로 생길 수 있어서, 알리기만 하고 막지는 않는다.
     let blocking = output.lines().any(|line| line.starts_with(FAIL) && !line.starts_with(&format!("{FAIL} 의존성")));
+    let reason = format!("{MARKER} 고치고 다시 점검하거나, 고치지 못하면 실패 상태임을 보고에 그대로 적으십시오.\n\n{output}");
+    if harness == Harness::Antigravity {
+        if let Some(mark) = mark_of(&data, marks) {
+            let _ = fs::remove_file(mark.with_extension("not-started"));
+            if !blocking {
+                let _ = fs::remove_file(mark);
+            }
+        }
+        let reply = if blocking && first_stop(&data, output, marks) { json!({"decision": "continue", "reason": reason}) } else { json!({"decision": "stop", "reason": summary}) };
+        return reply.to_string();
+    }
+    let active = match harness {
+        Harness::Hermes => data["extra"]["attempt"].as_u64().is_some_and(|attempt| attempt > 0),
+        _ => data["stop_hook_active"] == true,
+    };
+    // 매번 한 줄을 화면에 보여 준다. 이 줄이 안 보이면 훅이 돌지 않은 것이다.
+    let mut reply = json!({"systemMessage": summary});
     // 이미 한 번 막아서 이어 가는 중이면 다시 막지 않는다(끝없이 도는 것을 막는다). 실패 상태는 위 한 줄로 보인다.
     if blocking && !active {
         reply["decision"] = json!("block");
-        reply["reason"] = json!(format!("점검(./check)에 실패가 있습니다. 고치고 다시 점검하거나, 고치지 못하면 실패 상태임을 보고에 그대로 적으십시오.\n\n{output}"));
+        reply["reason"] = json!(reason);
     }
     reply.to_string()
 }
 
 /// 결과를 화면에 내고 종료 코드를 돌려준다. 훅이면 JSON 한 줄을 내고 0 을 돌려준다.
-fn report(hook: bool, code: u8, output: &str) -> u8 {
-    if !hook {
+fn report(hook: Option<Harness>, code: u8, output: &str) -> u8 {
+    let Some(harness) = hook else {
         print!("{output}");
         return code;
-    }
-    println!("{}", hook_reply(HOOK_INPUT.get().map_or("", String::as_str), output));
+    };
+    println!("{}", hook_reply(harness, HOOK_INPUT.get().map_or("", String::as_str), output, &marks_in(std::env::var_os("TMPDIR"))));
     0
 }
 
@@ -156,16 +232,29 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |name: &str| args.iter().any(|arg| arg == name);
     let value = |name: &str| args.iter().position(|arg| arg == name).and_then(|at| args.get(at + 1));
-    let hook = flag("--hook");
+    let hook = harness_of(&args);
+    if let Some(at) = args.iter().position(|arg| arg == "--guard") {
+        let mut input = String::new();
+        let _ = std::io::stdin().read_to_string(&mut input);
+        let data = serde_json::from_str(&input).unwrap_or(Value::Null);
+        let harness = args.get(at + 1).map_or("", String::as_str);
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        if let Some(path) = value("--root").and_then(|root| guard::Guard::new(Path::new(root), &home).judge(harness, &data)) {
+            println!("{}", guard::reply(harness, &path));
+        }
+        return ExitCode::SUCCESS;
+    }
     // 훅의 시간 한도(.claude/settings.json 의 300초)보다 먼저 스스로 끝나야 결과를 알릴 수 있다.
     let limit = value("--limit").and_then(|seconds| seconds.parse().ok()).unwrap_or(240);
     // 점검이 어디선가 멈춰도 실패로 끝나게 한다. 훅이 시간 한도에 걸려 끊기면 막지도 알리지도 못한 채 지나간다.
+    let root = value("--root").map(PathBuf::from);
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(limit + 5 + limit / 16));
-        let (code, output) = not_started("시간 안에 끝나지 않았습니다.");
+        let reason = "시간 안에 끝나지 않았습니다.";
+        let (code, output) = root.map_or_else(|| not_started(reason), |root| stopped(&root, reason));
         std::process::exit(report(hook, code, &output).into());
     });
-    if hook {
+    if hook.is_some() {
         let mut input = String::new();
         let _ = std::io::stdin().read_to_string(&mut input);
         let _ = HOOK_INPUT.set(input);
@@ -187,20 +276,113 @@ mod tests {
         assert_eq!(clean("✅ ⚠️ 한글 abc ―「」"), "✅ ⚠️ 한글 abc ―「」");
     }
 
+    const FAILED: &str = "❌ 카드: 1건\n\n결과: 실패 1개\n";
+
+    fn reply(harness: Harness, input: &str, output: &str, marks: &Path) -> Value {
+        serde_json::from_str(&hook_reply(harness, input, output, marks)).unwrap()
+    }
+
+    fn marks() -> std::path::PathBuf {
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("blockkit-marks-{}-{}", std::process::id(), COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     #[test]
     fn 훅은_실패일_때만_막고_의존성_실패와_이미_막은_경우는_알리기만_한다() {
-        let failed = "❌ 카드: 1건\n\n결과: 실패 1개\n";
-        let reply: Value = serde_json::from_str(&hook_reply("{}", failed)).unwrap();
-        assert_eq!((reply["systemMessage"].as_str(), reply["decision"].as_str()), (Some("점검(./check) 결과: 실패 1개"), Some("block")));
-        assert!(reply["reason"].as_str().unwrap().contains("❌ 카드"));
-        for (input, output) in [("{\"stop_hook_active\": true}", failed), ("{}", "❌ 의존성: 취약점\n\n결과: 실패 1개\n"), ("{}", "✅ 카드: 좋음\n\n결과: 전부 통과\n")] {
-            let reply: Value = serde_json::from_str(&hook_reply(input, output)).unwrap();
-            assert_eq!(reply.as_object().map(|fields| fields.len()), Some(1), "{reply}");
+        let marks = marks();
+        for harness in [Harness::Claude, Harness::Codex] {
+            let answer = reply(harness, "{}", FAILED, &marks);
+            assert_eq!((answer["systemMessage"].as_str(), answer["decision"].as_str()), (Some("점검(./check) 결과: 실패 1개"), Some("block")));
+            assert!(answer["reason"].as_str().unwrap().contains("❌ 카드"));
+            for (input, output) in [("{\"stop_hook_active\": true}", FAILED), ("{}", "❌ 의존성: 취약점\n\n결과: 실패 1개\n"), ("{}", "✅ 카드: 좋음\n\n결과: 전부 통과\n")] {
+                let answer = reply(harness, input, output, &marks);
+                assert_eq!(answer.as_object().map(|fields| fields.len()), Some(1), "{answer}");
+            }
+            // 입력이 이상해도 실패는 막는다.
+            for input in ["[]", "null", "", "{\"stop_hook_active\": tr"] {
+                assert_eq!(reply(harness, input, FAILED, &marks)["decision"], "block", "{input}");
+            }
         }
-        // 입력이 이상해도 실패는 막는다.
-        for input in ["[]", "null", "", "{\"stop_hook_active\": tr"] {
-            let reply: Value = serde_json::from_str(&hook_reply(input, failed)).unwrap();
-            assert_eq!(reply["decision"], "block", "{input}");
+        assert!(!marks.exists());
+    }
+
+    #[test]
+    fn 헤르메스는_이번_턴에_처음_멈출_때만_막는다() {
+        let marks = marks();
+        let input = |attempt: &str| format!("{{\"hook_event_name\": \"pre_verify\", \"session_id\": \"s\", \"extra\": {{\"attempt\": {attempt}, \"changed_paths\": [\"a.rs\"]}}}}");
+        let first = reply(Harness::Hermes, &input("0"), FAILED, &marks);
+        assert_eq!(first["decision"], "block");
+        assert!(first["reason"].as_str().unwrap().contains("❌ 카드"));
+        let again = reply(Harness::Hermes, &input("1"), FAILED, &marks);
+        assert!(again.get("decision").is_none() && again["systemMessage"] == "점검(./check) 결과: 실패 1개", "{again}");
+        assert_eq!(reply(Harness::Hermes, "{}", FAILED, &marks)["decision"], "block");
+        assert!(reply(Harness::Hermes, &input("0"), "✅ 카드: 좋음\n\n결과: 전부 통과\n", &marks).get("decision").is_none());
+    }
+
+    #[test]
+    fn 안티그래비티는_같은_실패로는_다시_이어_가지_않고_연속_세_번까지만_이어_가게_한다() {
+        let marks = marks();
+        let input = |id: &str| json!({"conversationId": id, "lastUserInput": "블록 하나 만들어 줘", "executionNum": 1, "terminationReason": "model_stop", "fullyIdle": true}).to_string();
+        let failed = |number: u32| format!("❌ 카드: {number}건\n\n결과: 실패 1개\n");
+        let first = reply(Harness::Antigravity, &input("c-1"), &failed(1), &marks);
+        assert_eq!(first["decision"], "continue");
+        assert!(first["reason"].as_str().unwrap().contains("❌ 카드: 1건"));
+        let again = reply(Harness::Antigravity, &input("c-1"), &failed(1), &marks);
+        assert_eq!((again["decision"].as_str(), again["reason"].as_str()), (Some("stop"), Some("점검(./check) 결과: 실패 1개")));
+        assert_eq!(reply(Harness::Antigravity, &input("c-1"), &failed(2), &marks)["decision"], "continue");
+        assert_eq!(reply(Harness::Antigravity, &input("c-1"), &failed(3), &marks)["decision"], "continue");
+        assert_eq!(reply(Harness::Antigravity, &input("c-1"), &failed(4), &marks)["decision"], "stop");
+        assert_eq!(reply(Harness::Antigravity, &input("c-2"), &failed(1), &marks)["decision"], "continue");
+        assert_eq!(reply(Harness::Antigravity, &input("c-1"), "✅ 카드: 좋음\n\n결과: 전부 통과\n", &marks)["decision"], "stop");
+        assert_eq!(reply(Harness::Antigravity, &input("c-1"), &failed(4), &marks)["decision"], "continue");
+        let said = |text: &str| json!({"conversationId": "c-8", "lastUserInput": text, "terminationReason": "model_stop", "fullyIdle": true}).to_string();
+        let pushed = reply(Harness::Antigravity, &said("요청 하나"), &failed(1), &marks);
+        assert_eq!(pushed["decision"], "continue");
+        let reason = pushed["reason"].as_str().unwrap().to_string();
+        assert_eq!(reply(Harness::Antigravity, &said(&format!("Hook: {reason}")), &failed(2), &marks)["decision"], "continue");
+        assert_eq!(reply(Harness::Antigravity, &said("요청 하나"), &failed(3), &marks)["decision"], "continue");
+        assert_eq!(reply(Harness::Antigravity, &said(&reason), &failed(4), &marks)["decision"], "stop");
+        assert_eq!(reply(Harness::Antigravity, &said("요청 둘"), &failed(4), &marks)["decision"], "continue");
+        assert_eq!(reply(Harness::Antigravity, &said("요청 둘"), &failed(4), &marks)["decision"], "stop");
+        assert_eq!(mark_of(&json!({"conversationId": "c_9/../x"}), &marks), Some(marks.join("c_9x")));
+        assert_eq!(marks_in(None), PathBuf::from("/tmp/blockkit-hook"));
+        assert_eq!(marks_in(Some("".into())), PathBuf::from("/tmp/blockkit-hook"));
+        assert_eq!(marks_in(Some("/x/".into())), PathBuf::from("/x/blockkit-hook"));
+        std::fs::write(marks.join("c-9.not-started"), "").unwrap();
+        reply(Harness::Antigravity, &input("c-9"), "✅ 카드: 좋음\n\n결과: 전부 통과\n", &marks);
+        assert!(!marks.join("c-9.not-started").exists());
+        for input in ["{}", "", "{\"conversationId\": \"\"}", "{\"conversationId\": \"/..\"}"] {
+            assert_eq!(reply(Harness::Antigravity, input, FAILED, &marks)["decision"], "stop", "{input}");
         }
+        let with = |reason: &str, idle: bool| json!({"conversationId": "c-6", "terminationReason": reason, "fullyIdle": idle}).to_string();
+        for input in [with("max_steps_exceeded", true), with("error", true), with("model_stop", false), json!({"conversationId": "c-6"}).to_string()] {
+            assert_eq!(reply(Harness::Antigravity, &input, FAILED, &marks)["decision"], "stop", "{input}");
+        }
+        assert_eq!(reply(Harness::Antigravity, &with("model_stop", true), FAILED, &marks)["decision"], "continue");
+        let blocked = marks.parent().unwrap().join(format!("{}-file", marks.file_name().unwrap().to_string_lossy()));
+        std::fs::write(&blocked, "").unwrap();
+        assert_eq!(reply(Harness::Antigravity, &input("c-3"), FAILED, &blocked)["decision"], "stop");
+        let _ = std::fs::remove_file(&blocked);
+        for output in ["✅ 카드: 좋음\n\n결과: 전부 통과\n", "❌ 의존성: 취약점\n\n결과: 실패 1개\n"] {
+            assert_eq!(reply(Harness::Antigravity, &input("c-4"), output, &marks)["decision"], "stop");
+        }
+        assert_eq!(reply(Harness::Antigravity, &input("../../c-5"), FAILED, &marks)["decision"], "continue");
+        let names: Vec<String> = std::fs::read_dir(&marks).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().all(|name| name.chars().all(|letter| letter.is_ascii_alphanumeric() || letter == '-')), "{names:?}");
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
+    #[test]
+    fn 훅_방언은_훅_바로_뒤의_이름으로_정한다() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(harness_of(&args(&["--root", "/p", "--offline"])), None);
+        assert_eq!(harness_of(&args(&["--root", "/p", "--hook"])), Some(Harness::Claude));
+        assert_eq!(harness_of(&args(&["--hook", "--offline"])), Some(Harness::Claude));
+        for (name, harness) in [("codex", Harness::Codex), ("hermes", Harness::Hermes), ("antigravity", Harness::Antigravity)] {
+            assert_eq!(harness_of(&args(&["--root", "/p", "--hook", name, "--offline"])), Some(harness));
+        }
+        assert_eq!(harness_of(&args(&["--hook", "gemini"])), Some(Harness::Claude));
     }
 }

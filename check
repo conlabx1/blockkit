@@ -1,8 +1,9 @@
 #!/bin/sh
 # 블록 조립 규칙을 지켰는지 점검한다. 이 파일은 점검 명령(tools/check, Rust)을 빌드해서 실행하는 실행기다.
 #
-# 사용법: ./check          사람이 읽는 결과를 출력한다.
-#         ./check --hook   Claude Code 의 Stop 훅으로 쓴다(.claude/settings.json).
+# 사용법: ./check                   사람이 읽는 결과를 출력한다.
+#         ./check --hook [이름]     답을 끝낼 때 도는 훅으로 쓴다. 이름은 codex, hermes, antigravity 이고 없으면 Claude Code 다.
+#         ./check --guard <이름>    도구를 쓰기 직전에 도는 훅으로 쓴다. 틀 파일을 고치는 호출을 막는다.
 #
 # 종료 코드: 0 전부 통과, 1 실패 있음(점검을 시작하지 못한 것도 실패다), 2 실패는 없지만 점검하지 못한 항목 있음.
 # 훅으로 불리면 결과를 JSON 한 줄로만 알리고 항상 0 으로 끝난다(훅에서는 종료 코드 2 가 차단으로 읽힌다).
@@ -13,29 +14,54 @@ root=$(cd "$(dirname "$0")" && pwd) || exit 1
 cd "$root" || exit 1
 
 hook=
+guard=
+dialect=
+prev=
 for arg in "$@"; do
+    case $prev in --hook | --guard) case $arg in codex | hermes | antigravity) dialect=$arg ;; esac ;; esac
     [ "$arg" = --hook ] && hook=1
+    [ "$arg" = --guard ] && guard=1
+    prev=$arg
 done
 input=
-[ -n "$hook" ] && input=$(cat)
+[ -n "$hook$guard" ] && input=$(cat)
 
 # 점검이 통째로 돌지 못한 상태를 「점검 못 함」으로 두면 그사이의 실패가 가려진다. 그래서 실패로 본다.
 # 훅에서는 여기서 죽으면 막지도 알리지도 못한 채 지나가므로, 훅의 답까지 여기서 만든다.
 # 이유($1)는 이 파일에 적힌 고정된 글자만 넘긴다. 바깥에서 온 글자를 JSON 에 끼워 넣지 않는다.
 not_started() {
+    [ -n "$guard" ] && exit 0
+    mkdir -p target 2>/dev/null && printf '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="3"><title>blockkit 점검</title><body style="margin:0;padding:24px;font-family:-apple-system,sans-serif;background:#c91a09;color:#fff"><h1>결과: 실패 1개(점검을 시작하지 못했습니다)</h1><p>%s</p>\n' "$1" >target/check.html 2>/dev/null
     if [ -z "$hook" ]; then
         printf '❌ 점검: 시작하지 못했습니다. %s\n\n결과: 실패 1개(점검을 시작하지 못했습니다)\n' "$1"
         exit 1
     fi
-    case $input in
-    # 이미 한 번 막아서 이어 가는 중이면 다시 막지 않는다(끝없이 도는 것을 막는다). 실패 상태는 한 줄로 보인다.
-    *'"stop_hook_active":true'* | *'"stop_hook_active": true'*)
-        printf '{"systemMessage":"점검(./check) 결과: 실패 1개(점검을 시작하지 못했습니다)"}\n'
-        ;;
-    *)
-        printf '{"systemMessage":"점검(./check) 결과: 실패 1개(점검을 시작하지 못했습니다)","decision":"block","reason":"점검(./check)을 시작하지 못했습니다. %s 터미널에서 ./check 를 돌려 원인을 확인하고, 고치지 못하면 실패 상태임을 보고에 그대로 적으십시오."}\n' "$1"
-        ;;
+    summary='점검(./check) 결과: 실패 1개(점검을 시작하지 못했습니다)'
+    reason="점검(./check)을 시작하지 못했습니다. $1 터미널에서 ./check 를 돌려 원인을 확인하고, 고치지 못하면 실패 상태임을 보고에 그대로 적으십시오."
+    if [ "$dialect" = antigravity ]; then
+        id=$(printf '%s' "$input" | tr -d '\n' | sed -n 's/.*"conversationId"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9_-]*\)".*/\1/p')
+        mark=${TMPDIR:-/tmp}/blockkit-hook/$id.not-started
+        idle=
+        case $input in *'"terminationReason"'*'"model_stop"'*) case $input in *'"fullyIdle":true'* | *'"fullyIdle": true'*) idle=1 ;; esac ;; esac
+        if [ -n "$idle" ] && [ -n "$id" ] && [ ! -e "$mark" ] && mkdir -p "${mark%/*}" && : >"$mark"; then
+            printf '{"decision":"continue","reason":"%s"}\n' "$reason"
+        else
+            printf '{"decision":"stop","reason":"%s"}\n' "$summary"
+        fi
+        exit 0
+    fi
+    active=
+    case $dialect:$input in
+    hermes:*'"attempt": '[1-9]* | hermes:*'"attempt":'[1-9]*) active=1 ;;
+    hermes:*) ;;
+    *'"stop_hook_active":true'* | *'"stop_hook_active": true'*) active=1 ;;
     esac
+    # 이미 한 번 막아서 이어 가는 중이면 다시 막지 않는다(끝없이 도는 것을 막는다). 실패 상태는 한 줄로 보인다.
+    if [ -n "$active" ]; then
+        printf '{"systemMessage":"%s"}\n' "$summary"
+    else
+        printf '{"systemMessage":"%s","decision":"block","reason":"%s"}\n' "$summary" "$reason"
+    fi
     exit 0
 }
 
@@ -59,7 +85,7 @@ export PATH
 
 # 훅은 300초에 끊기고, 끊기면 막지도 알리지도 못한 채 지나간다. 점검 명령은 길어도 260초에 스스로 끝나므로 빌드에는 30초를 준다.
 # 처음 빌드하거나 부품을 내려받느라 더 걸리면 여기서 막고, 터미널에서 한 번 돌리게 한다. 터미널에서는 사람이 보고 있으므로 한도를 두지 않는다.
-if [ -n "$hook" ]; then
+if [ -n "$hook$guard" ]; then
     "$cargo" build --locked --quiet --manifest-path tools/check/Cargo.toml </dev/null >/dev/null 2>&1 &
     build=$!
     # 감시하는 쪽이 훅의 출력 통로를 쥐고 있으면 훅이 끝나도 끝난 것으로 보이지 않는다. 그래서 입출력을 전부 떼어 둔다.
@@ -79,6 +105,11 @@ fi
 # 점검 명령은 자기 폴더의 Cargo.toml 과 Cargo.lock 만으로 빌드된다. 프로젝트의 설정이 바뀌어도 점검 명령은 그대로다.
 output=$(printf '%s' "$input" | "$cargo" run --locked --quiet --manifest-path tools/check/Cargo.toml -- --root "$root" "$@")
 code=$?
+
+if [ -n "$guard" ]; then
+    [ -n "$output" ] && printf '%s\n' "$output"
+    exit 0
+fi
 
 # 종료 코드만으로 판정하지 않는다. 끝까지 돌았다는 표시(훅에서는 JSON 한 줄, 아니면 줄 머리의 「결과:」)가 있어야 한다.
 if [ -n "$hook" ]; then

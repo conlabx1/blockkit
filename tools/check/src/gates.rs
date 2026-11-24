@@ -25,8 +25,16 @@ const HOOK_COMMAND: &str = "sh \"${CLAUDE_PROJECT_DIR}/check\" --hook";
 /// 틀 자체의 파일. .claude/settings.json 의 permissions.deny 에 있어야 편집 도구와 터미널 명령(>, tee, sed, cp, mv, rm)이 이 파일을 고치지 못한다.
 /// 승인만 물으면 「편집 자동 허용」 모드에서 「>」 덧쓰기가 묻지 않고 실행된다. 틀은 이 설정이 적용되지 않는 상위 폴더에서 연 세션에서 고친다.
 /// rust-toolchain 과 .cargo 는 없어야 하는 파일이다. 생기면 점검 명령이 빌드되기 전에 컴파일러와 빌드 설정이 바뀐다.
-const DENY_RULES: [&str; 6] =
-    ["Edit(/check)", "Edit(/tools/check/**)", "Edit(/.claude/settings.json)", "Edit(/rust-toolchain.toml)", "Edit(/rust-toolchain)", "Edit(/.cargo/**)"];
+const DENY_RULES: [&str; 8] = [
+    "Edit(/check)",
+    "Edit(/tools/check/**)",
+    "Edit(/.claude/settings.json)",
+    "Edit(/rust-toolchain.toml)",
+    "Edit(/rust-toolchain)",
+    "Edit(/.cargo/**)",
+    "Edit(/.codex/**)",
+    "Edit(/.agents/hooks.json)",
+];
 /// 주인 승인 없이 바뀌면 안 되는 것들. .claude/settings.json 의 permissions.ask 에 있어야 Claude Code 가 주인에게 묻는다.
 /// Bash 규칙: 「편집 자동 허용」 모드는 rm·mv·cp 를 묻지 않고 돌려서, 위의 Edit 규칙을 돌아갈 수 있다.
 // shortcut: 카드처럼 승인만 묻는 파일은 「편집 자동 허용」 모드의 「>」 덧쓰기를 막지 못한다, 필요해지면 샌드박스로 막는다.
@@ -42,6 +50,18 @@ const ASK_RULES: [&str; 10] = [
     "Bash(mv *)",
     "Bash(cp *)",
 ];
+
+fn harness_command(mode: &str) -> String {
+    format!("sh -c 'd=$(pwd); while [ ! -f \"$d/check\" ] || [ ! -d \"$d/tools/check\" ]; do [ \"$d\" = / ] && exit 0; d=$(dirname \"$d\"); done; exec sh \"$d/check\" {mode}'")
+}
+
+fn harness_hooks() -> [(&'static str, Value); 2] {
+    let hook = |mode: &str, timeout: u32| json!({"type": "command", "command": harness_command(mode), "timeout": timeout});
+    [
+        (".codex/hooks.json", json!({"hooks": {"Stop": [{"hooks": [hook("--hook codex", 300)]}], "PreToolUse": [{"hooks": [hook("--guard codex", 60)]}]}})),
+        (".agents/hooks.json", json!({"blockkit": {"Stop": [hook("--hook antigravity", 300)], "PreToolUse": [{"matcher": ".*", "hooks": [hook("--guard antigravity", 60)]}]}})),
+    ]
+}
 
 /// 블록은 계산만 한다. 그래서 표준 라이브러리에서 바깥(파일, 네트워크, 다른 프로그램, 환경 변수, 시계, 난수, 대기)과 닿지 않는 모듈만 허용한다.
 const PURE_STD: [&str; 28] = [
@@ -369,7 +389,7 @@ fn forbidden_line(line: &str) -> Option<String> {
 }
 
 /// 카드의 금지 사항에 적힌 번호들
-fn forbidden_ids(card: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+pub fn forbidden_ids(card: &BTreeMap<String, Vec<String>>) -> Vec<String> {
     card.get("금지 사항").into_iter().flatten().map(String::as_str).filter_map(forbidden_line).collect()
 }
 
@@ -772,6 +792,16 @@ pub fn devices(project: &Project) -> Gate {
             problems.push(format!(".claude/settings.json: 틀이 정한 내용과 다릅니다. {rules} {how}"));
         }
     }
+    for (name, expected) in harness_hooks() {
+        let written = fs::read_to_string(project.root.join(name)).ok().and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        if written != Some(expected) {
+            problems.push(format!("{name}: 틀이 정한 내용과 다릅니다. 이 파일은 잠겨 있으므로 상위 폴더에서 연 세션에서 되돌립니다."));
+        }
+    }
+    let codex = fs::read_to_string(project.root.join(".codex/config.toml")).ok().and_then(|text| text.parse::<toml::Table>().ok());
+    if codex.as_ref().and_then(|table| table.get("features")).is_some_and(|features| ["hooks", "codex_hooks"].iter().any(|key| features.get(key) == Some(&toml::Value::Boolean(false)))) {
+        problems.push(".codex/config.toml: 훅을 끄는 설정(features.hooks = false)이 있습니다.".to_string());
+    }
     // rust-toolchain.toml 이 고정한 버전으로 실제로 도는지 본다. 다른 버전이 돌면 패턴 검사의 내용이 달라진다.
     let pinned = fs::read_to_string(project.root.join("rust-toolchain.toml")).ok().and_then(|text| text.parse::<toml::Table>().ok());
     let pinned = pinned.as_ref().and_then(|table| table.get("toolchain")?.get("channel")?.as_str());
@@ -785,7 +815,11 @@ pub fn devices(project: &Project) -> Gate {
         }
         _ => {}
     }
-    let good = format!("답을 끝낼 때마다 도는 점검, 잠금 규칙 {}개, 승인 규칙 {}개가 설정 파일에 그대로 적혀 있고, 고정한 Rust 버전으로 돕니다.", DENY_RULES.len(), ASK_RULES.len());
+    let good = format!(
+        "답을 끝낼 때마다 도는 점검, 잠금 규칙 {}개, 승인 규칙 {}개와 Codex·Antigravity 훅이 설정 파일에 그대로 적혀 있고, 고정한 Rust 버전으로 돕니다. 하네스가 훅을 실제로 켰는지는 이 관문이 보지 못합니다.",
+        DENY_RULES.len(),
+        ASK_RULES.len()
+    );
     counted(problems, good)
 }
 
