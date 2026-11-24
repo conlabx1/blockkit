@@ -333,7 +333,7 @@ pub fn functions(tokens: &[Flat]) -> Vec<Function> {
         match &tokens[index].tok {
             Tok::Ident(word) if word == "fn" => {
                 if let Some(name) = ident(tokens, index + 1) {
-                    let asserts = body(tokens, index + 2).is_some_and(|(open, end)| (open..end).any(|at| checks_at(tokens, at)));
+                    let asserts = body(tokens, index + 2).is_some_and(|(open, end)| checks_in(tokens, open, end));
                     found.push(Function {
                         name: name.to_string(),
                         // `tokio::test(flavor = "…")` 처럼 인자가 붙어도 시험 표시다.
@@ -363,11 +363,28 @@ fn body(tokens: &[Flat], mut at: usize) -> Option<(usize, usize)> {
     }
 }
 
+fn checks_in(tokens: &[Flat], open: usize, end: usize) -> bool {
+    let mut at = open + 1;
+    while at < end {
+        if ident(tokens, at) == Some("fn")
+            && ident(tokens, at + 1).is_some()
+            && let Some((_, inner)) = body(tokens, at + 2)
+        {
+            at = inner + 1;
+        } else if checks_at(tokens, at) {
+            return true;
+        } else {
+            at += 1;
+        }
+    }
+    false
+}
+
 fn checks_at(tokens: &[Flat], at: usize) -> bool {
     match ident(tokens, at) {
         // debug_assert 계열은 빌드 설정에 따라 사라질 수 있어서 확인으로 치지 않는다.
         Some(word) if punct(tokens, at + 1, '!') => word.starts_with("assert") || matches!(word, "panic" | "unreachable"),
-        Some("unwrap" | "expect" | "unwrap_err" | "expect_err") => at > 0 && punct(tokens, at - 1, '.'),
+        Some("unwrap" | "expect" | "unwrap_err" | "expect_err") => at > 0 && punct(tokens, at - 1, '.') && opens(tokens, at + 1, '('),
         _ => false,
     }
 }

@@ -370,19 +370,7 @@ fn forbidden_line(line: &str) -> Option<String> {
 
 /// 카드의 금지 사항에 적힌 번호들
 fn forbidden_ids(card: &BTreeMap<String, Vec<String>>) -> Vec<String> {
-    let mut found = Vec::new();
-    for line in card.get("금지 사항").into_iter().flatten() {
-        for part in line.split('[').skip(1) {
-            if let Some((inside, _)) = part.split_once(']')
-                && let Some(digits) = inside.strip_prefix('N')
-                && !digits.is_empty()
-                && digits.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                found.push(inside.to_string());
-            }
-        }
-    }
-    found
+    card.get("금지 사항").into_iter().flatten().map(String::as_str).filter_map(forbidden_line).collect()
 }
 
 /// Rust 코드 파일을 둘 수 있는 자리인가.
@@ -544,11 +532,18 @@ fn run_tests(project: &Project, executed: &mut Vec<(String, String)>) -> Gate {
     // 소스에는 있는데 시험 목록에 없는 시험: 파일이 mod 선언으로 이어지지 않았거나, 조건에 걸려 빠진 것이다. 있는 줄 알았던 시험이 없는 것이다.
     let (mut missing, mut idle) = (Vec::new(), Vec::new());
     for dir in project.crates() {
+        let mut sources: BTreeMap<String, Vec<&str>> = BTreeMap::new();
         for file in project.sources(&dir, &["src", "tests"]) {
             for function in project.tokens(file).iter().flat_map(|tokens| scan::functions(tokens)) {
-                if function.test && !listed.iter().any(|(unit, name)| *unit == dir && name.rsplit("::").next() == Some(function.name.as_str())) {
-                    missing.push(format!("{} ({file})", pretty(&dir, &function.name)));
+                if function.test {
+                    sources.entry(function.name).or_default().push(file);
                 }
+            }
+        }
+        for (name, files) in sources {
+            let ran = listed.iter().filter(|(unit, listed)| *unit == dir && listed.rsplit("::").next() == Some(name.as_str())).count();
+            if files.len() > ran {
+                missing.push(format!("{} ({})", pretty(&dir, &name), files.join(", ")));
             }
         }
         if !executed.iter().any(|(unit, _)| *unit == dir) {

@@ -442,6 +442,13 @@ fn 이어지지_않은_파일의_시험은_돌지_않은_것으로_나온다() {
 }
 
 #[test]
+fn 이어지지_않은_파일의_시험은_도는_시험과_이름이_같아도_돌지_않은_것으로_나온다() {
+    let project = Project::new();
+    project.write("blocks/sample/src/more.rs", "#[test]\nfn 대문자로_바꾼다() {\n    assert_eq!(1 + 1, 2);\n}\n");
+    project.fails("시험", &["돌지 않음: blocks/sample: 대문자로_바꾼다 (", "blocks/sample/src/more.rs", "돌지 않은 시험 1개"]);
+}
+
+#[test]
 fn 시험_도중에_프로그램을_끝내면_통과로_치지_않는다() {
     let project = Project::new();
     project.write("blocks/sample/tests/quit.rs", "#[test]\nfn 조용히_끝낸다() {\n    std::process::exit(0);\n}\n");
@@ -480,6 +487,35 @@ fn 확인하는_줄이_없는_시험은_실패한다() {
     // 어디에도 이어지지 않은 파일에 같은 이름의 함수를 두어서 확인하는 줄이 있는 것처럼 꾸밀 수 없다.
     project.write("blocks/sample/src/unused.rs", "fn n2_줄바꿈이_든_글자는_받지_않는다() {\n    assert!(true);\n}\n");
     project.fails("금지 연결", &["blocks/sample: 금지 사항의 시험 「n2_줄바꿈이_든_글자는_받지_않는다」 이 두 군데에 있습니다."]);
+}
+
+#[test]
+fn 안쪽_함수의_확인과_unwrap_이라는_필드는_확인하는_줄로_치지_않는다() {
+    for body in [
+        "fn _도우미() {\n            assert!(shout(\"\").is_err());\n        }\n        let _ = shout(\"ab\");",
+        "struct S {\n            unwrap: i32,\n        }\n        let s = S { unwrap: 1 };\n        let _ = (s.unwrap, shout(\"ab\"));",
+    ] {
+        let project = Project::new();
+        project.edit(BLOCK, "assert!(shout(\"a\\nb\").is_err());", body);
+        project.fails("금지 연결", &["blocks/sample: 금지 사항 [N2] 의 시험에 확인하는 줄(assert…)이 없습니다."]);
+    }
+}
+
+#[test]
+fn unwrap_을_부르는_줄과_클로저_안의_확인은_확인하는_줄이다() {
+    for body in ["let _ = shout(\"a\\nb\").unwrap_err();", "let check = |text: &str| assert!(shout(text).is_err());\n        check(\"a\\nb\");"] {
+        let project = Project::new();
+        project.edit(BLOCK, "assert!(shout(\"a\\nb\").is_err());", body);
+        project.passes();
+    }
+}
+
+#[test]
+fn 금지_사항_본문에_적은_다른_번호는_금지_사항으로_치지_않는다() {
+    let project = Project::new();
+    project.edit(CARD, "- [N1] 빈 글자는 받지 않는다.", "- [N1] 빈 글자는 받지 않는다([N9]와 [N2]도 함께 본다).");
+    let output = project.passes();
+    assert!(output.contains("✅ 금지 연결: 카드의 금지 사항 2개마다"), "{output}");
 }
 
 #[test]
