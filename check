@@ -39,11 +39,10 @@ not_started() {
     summary='점검(./check) 결과: 실패 1개(점검을 시작하지 못했습니다)'
     reason="점검(./check)을 시작하지 못했습니다. $1 터미널에서 ./check 를 돌려 원인을 확인하고, 고치지 못하면 실패 상태임을 보고에 그대로 적으십시오."
     if [ "$dialect" = antigravity ]; then
-        id=$(printf '%s' "$input" | tr -d '\n' | sed -n 's/.*"conversationId"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9_-]*\)".*/\1/p')
-        mark=${TMPDIR:-/tmp}/blockkit-hook/$id.not-started
         idle=
-        case $input in *'"terminationReason"'*'"model_stop"'*) case $input in *'"fullyIdle":true'* | *'"fullyIdle": true'*) idle=1 ;; esac ;; esac
-        if [ -n "$idle" ] && [ -n "$id" ] && [ ! -e "$mark" ] && mkdir -p "${mark%/*}" && : >"$mark"; then
+        case $input in *'"terminationReason":"NO_TOOL_CALL"'* | *'"terminationReason": "NO_TOOL_CALL"'*) case $input in *'"fullyIdle":true'* | *'"fullyIdle": true'*) idle=1 ;; esac ;; esac
+        case $input in *'"continuationActive":true'* | *'"continuationActive": true'*) idle= ;; esac
+        if [ -n "$idle" ]; then
             printf '{"decision":"continue","reason":"%s"}\n' "$reason"
         else
             printf '{"decision":"stop","reason":"%s"}\n' "$summary"
@@ -107,7 +106,7 @@ output=$(printf '%s' "$input" | "$cargo" run --locked --quiet --manifest-path to
 code=$?
 
 if [ -n "$guard" ]; then
-    [ -n "$output" ] && printf '%s\n' "$output"
+    case $code:$output in 0:'{"'*) printf '%s\n' "$output" ;; esac
     exit 0
 fi
 

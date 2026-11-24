@@ -7,10 +7,12 @@ const LOCKED_FILES: [&str; 5] = ["check", "rust-toolchain.toml", "rust-toolchain
 const LOCKED_DIRS: [&str; 3] = ["tools/check", ".cargo", ".codex"];
 const HOLDERS: [&str; 4] = ["tools", ".claude", ".agents", ""];
 const BUILT: &str = "tools/check/target";
-const WRITERS: [&str; 25] = [
+const WRITERS: [&str; 23] = [
     "rm", "rmdir", "unlink", "mv", "cp", "ln", "tee", "sed", "gsed", "perl", "dd", "chmod", "chown", "chflags", "xattr", "truncate", "touch", "install",
-    "rsync", "ditto", "patch", "shred", "mkdir", "curl", "wget",
+    "rsync", "ditto", "patch", "shred", "mkdir",
 ];
+const FETCHERS: [&str; 2] = ["curl", "wget"];
+const SAVES: [&str; 8] = ["--output", "--dump-header", "--cookie-jar", "--trace", "--stderr", "--directory-prefix", "--append-output", "--save-cookies"];
 const GIT_WRITERS: [&str; 6] = ["rm", "mv", "checkout", "restore", "apply", "clean"];
 const PREFIXES: [&str; 16] = ["sudo", "env", "xargs", "command", "exec", "nohup", "time", "nice", "then", "do", "else", "elif", "if", "while", "until", "!"];
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "eval"];
@@ -59,21 +61,34 @@ fn without_heredocs(text: &str) -> String {
         out.push_str(line);
         out.push('\n');
         let mut ends = Vec::new();
-        let mut rest = line;
-        while let Some(at) = rest.find("<<") {
-            rest = &rest[at + 2..];
-            if let Some(after) = rest.strip_prefix('<') {
-                rest = after;
-                continue;
-            }
-            let end: String = rest.trim_start_matches('-').trim_start().chars().take_while(|letter| !letter.is_whitespace() && !";|&<>()".contains(*letter)).collect();
-            let end = end.trim_matches(['\'', '"', '\\']).to_string();
-            if !end.is_empty() {
-                ends.push(end);
+        let (mut quote, mut depth, mut escaped) = (None, 0, false);
+        for (at, letter) in line.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if quote == Some('\'') {
+                quote = (letter != '\'').then_some('\'');
+            } else if letter == '\\' {
+                escaped = true;
+            } else if quote == Some('"') {
+                quote = (letter != '"').then_some('"');
+            } else if letter == '\'' || letter == '"' {
+                quote = Some(letter);
+            } else if letter == '(' && (depth > 0 || line[..at].ends_with('$') && line[at + 1..].starts_with('(')) {
+                depth += 1;
+            } else if letter == ')' && depth > 0 {
+                depth -= 1;
+            } else if letter == '<' && depth == 0 && line[at..].starts_with("<<") && !line[..at].ends_with('<') {
+                let end: String = line[at + 2..].trim_start_matches('-').trim_start().chars().take_while(|letter| !letter.is_whitespace() && !";|&<>()".contains(*letter)).collect();
+                let end = end.trim_matches(['\'', '"', '\\']).to_string();
+                if !end.is_empty() {
+                    ends.push(end);
+                }
             }
         }
         for end in ends {
-            if lines.by_ref().any(|body| body.trim() == end) {
+            let mut ahead = lines.clone();
+            if ahead.any(|body| body.trim() == end) {
+                lines = ahead;
                 out.push_str(&end);
                 out.push('\n');
             }
@@ -131,6 +146,27 @@ fn segments(text: &str) -> Vec<Vec<(String, bool)>> {
         all.last_mut().expect("segments always holds one").push((word, quoted));
     }
     all
+}
+
+fn braces(word: &str) -> Vec<String> {
+    let Some(open) = word.find('{') else {
+        return vec![word.to_string()];
+    };
+    let mut depth = 0;
+    let mut cuts = vec![open];
+    for (at, letter) in word.char_indices().skip_while(|(at, _)| *at < open) {
+        match letter {
+            '{' => depth += 1,
+            ',' if depth == 1 => cuts.push(at),
+            '}' if depth == 1 => {
+                cuts.push(at);
+                return cuts.windows(2).flat_map(|pair| braces(&format!("{}{}{}", &word[..open], &word[pair[0] + 1..pair[1]], &word[at + 1..]))).collect();
+            }
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    vec![word.to_string()]
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -229,13 +265,18 @@ impl Guard {
     fn command(&self, text: &str, bases: &[PathBuf]) -> Option<String> {
         let mut bases = if bases.is_empty() { self.roots.clone() } else { bases.to_vec() };
         let mut fallback = true;
+        let mut stack = Vec::new();
         for segment in segments(&without_heredocs(text)) {
             let mut program: Option<String> = None;
             let mut git_write = false;
             let mut git_sub = false;
+            let mut git_cmd = false;
             let mut worktree = false;
             let mut redirect = false;
             let mut moved = None;
+            let mut here = bases.clone();
+            let mut previous = String::new();
+            let saves = segment.iter().any(|(word, _)| SAVES.iter().any(|head| word.starts_with(head)) || word.starts_with('-') && !word.starts_with("--") && word.contains(['o', 'O', 'D', 'c', 'P', 'a']));
             for (word, quoted) in segment {
                 if word == ">" {
                     redirect = true;
@@ -244,14 +285,25 @@ impl Guard {
                 if word == "<" {
                     continue;
                 }
-                let parts: Vec<&str> = word.split(['=', ',', '{', '}']).filter(|part| !part.is_empty()).collect();
+                let parts: Vec<String> = if word.starts_with("http://") || word.starts_with("https://") {
+                    vec![word.clone()]
+                } else {
+                    braces(&word).iter().flat_map(|choice| choice.split('=').map(str::to_string).collect::<Vec<_>>()).filter(|part| !part.is_empty()).collect()
+                };
                 let assignment = program.is_none() && word.split_once('=').is_some_and(|(name, _)| !name.is_empty() && name.chars().all(|letter| letter.is_ascii_alphanumeric() || letter == '_'));
                 let prefixed = program.as_deref().is_some_and(|name| PREFIXES.contains(&name)) && !word.starts_with('-') && !word.contains('=');
                 let first = (program.is_none() && !assignment) || prefixed;
                 let name = program.as_deref().unwrap_or_default();
-                if name == "cd" && !first && moved.is_none() {
+                if (name == "cd" || name == "pushd") && !first && moved.is_none() && !word.starts_with('-') {
                     moved = Some(bases.iter().map(|base| normalize(&base.join(self.expand(&word)))).collect::<Vec<_>>());
                 }
+                if name == "git" && previous == "-C" && !git_cmd {
+                    here = here.iter().map(|base| normalize(&base.join(self.expand(&word)))).collect();
+                }
+                if name == "git" && !first && !word.starts_with('-') && !["-C", "-c"].contains(&previous.as_str()) {
+                    git_cmd = true;
+                }
+                let branch = name == "git" && ["-b", "-B"].contains(&previous.as_str());
                 if name == "git" && GIT_WRITERS.contains(&word.as_str()) {
                     git_write = true;
                     git_sub = true;
@@ -268,18 +320,19 @@ impl Guard {
                 {
                     return Some(found);
                 }
-                let writes = redirect || (!first && !assignment && (WRITERS.contains(&name) || git_write));
+                let writes = redirect || (!first && !assignment && !branch && (WRITERS.contains(&name) || git_write || FETCHERS.contains(&name) && saves));
                 let interpreter = INTERPRETERS.contains(&name);
                 let read = !quoted || interpreter;
                 if first {
                     program = parts.first().map(|part| part.rsplit('/').next().unwrap_or(part).to_string());
                 }
+                let target = if redirect { &bases } else { &here };
                 redirect = false;
                 for part in parts.iter().skip(usize::from(assignment)) {
                     let found = if writes {
-                        self.shell_write(part, &bases, fallback)
+                        self.shell_write(part, target, fallback)
                     } else if read {
-                        self.shell_read(part, &bases, fallback, interpreter)
+                        self.shell_read(part, target, fallback, interpreter)
                     } else {
                         None
                     };
@@ -287,8 +340,17 @@ impl Guard {
                         return found;
                     }
                 }
+                previous = word;
             }
-            if let Some(moved) = moved {
+            if program.as_deref() == Some("popd") {
+                if let Some((old, back)) = stack.pop() {
+                    bases = old;
+                    fallback = back;
+                }
+            } else if let Some(moved) = moved {
+                if program.as_deref() == Some("pushd") {
+                    stack.push((bases.clone(), fallback));
+                }
                 bases = moved;
                 fallback = false;
             }
@@ -335,7 +397,7 @@ impl Guard {
             "hermes" => (data["tool_name"].as_str().unwrap_or_default(), &data["tool_input"], base(&data["tool_input"]["workdir"]).into_iter().chain(base(&data["cwd"])).collect()),
             "antigravity" => {
                 let args = &data["toolCall"]["args"];
-                (data["toolCall"]["name"].as_str().unwrap_or_default(), args, base(&args["Cwd"]).into_iter().chain(data["workspacePaths"].as_array().into_iter().flatten().filter_map(base)).collect())
+                (data["toolCall"]["name"].as_str().unwrap_or_default(), args, base(&args["Cwd"]).into_iter().chain(base(&data["cwd"])).chain(data["workspacePaths"].as_array().into_iter().flatten().filter_map(base)).collect())
             }
             _ => return None,
         };
@@ -347,6 +409,7 @@ impl Guard {
             ("hermes", "patch") => Some(named("path").and_then(|text| self.path(&text, &bases)).or_else(|| named("patch").and_then(|text| self.patch(&text, &bases)))),
             ("hermes", "terminal") => named("command").map(|text| self.command(&text, &bases)),
             ("antigravity", "write_to_file" | "replace_file_content" | "multi_replace_file_content") => named("TargetFile").map(|text| self.path(&text, &bases)),
+            ("antigravity", "write_file" | "edit_file") => named("Path").map(|text| self.path(&text, &bases)),
             ("antigravity", "run_command") => named("CommandLine").map(|text| self.command(&text, &bases)),
             _ => None,
         };
@@ -431,6 +494,43 @@ mod tests {
             "node -e \"require('fs').mkdirSync('.cargo')\"",
             "rm /p/my\\ project/check",
             "cp x \\\n  check",
+            "echo \"<<EOF\"\nrm check",
+            "echo $((1 << 2))\nrm check",
+            "echo \"<<EOF\"\nrm check\nEOF",
+            "echo $((1 << n))\nrm check\nn",
+            "echo $(( (1) << n ))\nrm check\nn",
+            "cat <<< x\nrm check\nx",
+            "cat <<EOF\nrm check",
+            "git -C tools log check/src/main.rs",
+            "cd blocks && git apply -C 1 ../tools/check/x.patch",
+            "curl --output check https://example.com/x",
+            "cd blocks && git -C greet log > ../check",
+            "cd blocks && git diff -C HEAD~1 > ../check",
+            "git -C tools -C check checkout src/main.rs",
+            "pushd blocks && cargo test; popd; rm check",
+            "rm -rf {.cargo,tools/{a,b}}",
+            "rm {check,a{b,c}}",
+            "rm {a=b,check}",
+            "curl -D check https://x/y",
+            "curl -c check https://x/y",
+            "curl --cookie-jar check https://x/y",
+            "wget -P .cargo https://x/y",
+            "wget --directory-prefix=.cargo https://x/y",
+            "rm -rf tools/{x,{check,y}}",
+            "git -c core.x=1 -C tools checkout -- check/src/main.rs",
+            "curl --dump-header check https://x/y",
+            "curl --trace check https://x/y",
+            "curl --stderr check https://x/y",
+            "wget --append-output=check https://x/y",
+            "wget --save-cookies check https://x/y",
+            "wget -a check https://x/y",
+            "cd -P tools && rm -rf check",
+            "cd -- tools && rm -rf check",
+            "pushd tools && rm -rf check/src/main.rs",
+            "git -C tools checkout -- check/src/main.rs",
+            "rm -rf tools/{check,x}",
+            "curl -sSLo check https://example.com/x",
+            "wget -O check https://example.com/x",
         ] {
             assert!(guard().judge("codex", &codex_bash(command)).is_some(), "{command}");
         }
@@ -480,9 +580,26 @@ mod tests {
             "rm -rf ?cargo",
             "git grep -W foo .",
             "git diff -W .",
+            "git checkout -b check",
+            "git checkout -b tools",
+            "git checkout -B check",
+            "cp blocks/greet/{check,other} /tmp/",
+            "curl -s https://example.com/api?mode=check",
+            "curl -o /tmp/x.json https://example.com/api?mode=check",
+            "curl -o /tmp/x http://example.com/?mode=check",
+            "curl --compressed -H check https://example.com/x",
+            "rm -f notes,check",
+            "echo 'x' && cat <<EOF\nrm check\nEOF",
+            "echo \"x\" && cat <<EOF\nrm check\nEOF",
+            "echo \\\"x && cat <<EOF\nrm check\nEOF",
+            "echo $((1)) && cat <<EOF\nrm check\nEOF",
+            "pushd blocks/greet && rm -f check",
+            "cd blocks/greet && popd; rm -f check",
         ] {
             assert_eq!(guard().judge("codex", &codex_bash(command)), None, "{command}");
         }
+        let below = json!({"tool_name": "Bash", "cwd": "/p/my project/blocks", "tool_input": {"command": "pushd greet && cargo test; popd; rm check"}});
+        assert!(guard().judge("codex", &below).is_some());
     }
 
     #[test]
@@ -516,6 +633,11 @@ mod tests {
         assert!(guard().judge("antigravity", &antigravity("write_to_file", json!({"TargetFile": "/p/my project/check", "CodeContent": "x"}))).is_some());
         assert!(guard().judge("antigravity", &antigravity("replace_file_content", json!({"TargetFile": "/p/my project/tools/check/src/main.rs"}))).is_some());
         assert!(guard().judge("antigravity", &antigravity("run_command", json!({"CommandLine": "rm check", "Cwd": "/p/my project"}))).is_some());
+        let below = json!({"toolCall": {"name": "run_command", "args": {"CommandLine": "rm -rf check/src/main.rs"}}, "cwd": "/p/my project/tools", "workspacePaths": ["/p/my project"]});
+        assert!(guard().judge("antigravity", &below).is_some());
+        assert!(guard().judge("antigravity", &antigravity("write_file", json!({"Path": "/p/my project/tools"}))).is_some());
+        assert!(guard().judge("antigravity", &antigravity("edit_file", json!({"Path": "/p/my project/.claude"}))).is_some());
+        assert_eq!(guard().judge("antigravity", &antigravity("write_file", json!({"Path": "/p/my project/blocks/a/src/lib.rs"}))), None);
         assert_eq!(guard().judge("antigravity", &antigravity("view_file", json!({"AbsolutePath": "/p/my project/blocks/a/CARD.md"}))), None);
         assert!(guard().judge("antigravity", &antigravity("view_file", json!({"AbsolutePath": "/p/my project/tools/check/src/main.rs"}))).is_some());
         assert_eq!(guard().judge("antigravity", &antigravity("list_dir", json!({"DirectoryPath": "/p/my project"}))), None);

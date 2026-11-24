@@ -428,6 +428,9 @@ fn 블록이_약속을_어기면_깨진_약속의_이름이_나온다() {
     project.edit(BLOCK, "if text.is_empty() {", "if text == \"없음\" {");
     project.edit(BLOCK, "Ok(text.to_uppercase())", "Ok(text.to_lowercase())");
     project.fails("시험", &["4개 가운데 실패 3개", "실패: blocks/sample: n1_빈_글자는_받지_않는다", "실패: 조립(app): 전체가_돈다"]);
+    let page = project.read("target/check.html");
+    assert!(page.contains(r#"class="brick name fail" data-unit="blocks/sample""#) && page.contains(r#"class="brick name fail" data-unit="app""#), "{page}");
+    assert!(page.contains(r#"class="brick fail" data-id="N1""#) && page.contains(r#"class="brick ok" data-id="N2""#), "{page}");
 }
 
 #[test]
@@ -1306,18 +1309,25 @@ fn 실행기는_점검을_시작하지_못하면_하네스마다_그_하네스�
         assert_eq!(answer(&args, again), json!({"systemMessage": "점검(./check) 결과: 실패 1개(점검을 시작하지 못했습니다)"}), "{args:?} {again}");
     }
     let antigravity = ["--hook", "antigravity"];
-    let input = |id: &str| json!({"conversationId": id, "lastUserInput": "만들어 줘", "executionNum": 1, "terminationReason": "model_stop", "fullyIdle": true}).to_string();
-    let reply = answer(&antigravity, &input("c-1"));
+    let input = |active: bool| json!({"conversationId": "c-1", "lastUserInput": "만들어 줘", "executionNum": 0, "terminationReason": "NO_TOOL_CALL", "fullyIdle": true, "continuationActive": active}).to_string();
+    let reply = answer(&antigravity, &input(false));
     assert_eq!(reply["decision"], "continue", "{reply}");
     assert!(reply["reason"].as_str().unwrap().contains("시작하지 못했습니다"), "{reply}");
+    assert_eq!(answer(&antigravity, &input(false))["decision"], "continue");
     let stopped = json!({"decision": "stop", "reason": "점검(./check) 결과: 실패 1개(점검을 시작하지 못했습니다)"});
-    assert_eq!(answer(&antigravity, &input("c-1")), stopped);
-    assert_eq!(answer(&antigravity, &input("c-2"))["decision"], "continue");
-    assert_eq!(answer(&antigravity, &input("c_4"))["decision"], "continue");
-    for input in ["{}", "", "{\"conversationId\": \"../x\"}", "{\"conversationId\": \"c-3\", \"terminationReason\": \"error\", \"fullyIdle\": true}", "{\"conversationId\": \"c-3\", \"terminationReason\": \"model_stop\", \"fullyIdle\": false}"] {
+    assert_eq!(answer(&antigravity, &input(true)), stopped);
+    for input in [
+        "{}",
+        "",
+        "{\"terminationReason\": \"ERROR\", \"fullyIdle\": true}",
+        "{\"terminationReason\": \"model_stop\", \"fullyIdle\": true}",
+        "{\"terminationReason\": \"NO_TOOL_CALL\", \"fullyIdle\": false}",
+        "{\"terminationReason\": \"NO_TOOL_CALL\", \"fullyIdle\": true, \"continuationActive\": true}",
+    ] {
         assert_eq!(answer(&antigravity, input), stopped, "{input}");
     }
-    assert_eq!(answer(&antigravity, &input("c-3"))["decision"], "continue");
+    assert_eq!(answer(&antigravity, "{\"terminationReason\": \"NO_TOOL_CALL\", \"fullyIdle\": true}")["decision"], "continue");
+    assert!(!launcher.dir.join("blockkit-hook").exists());
     for dialect in ["codex", "hermes", "antigravity"] {
         assert_eq!(launcher.run(&["--guard", dialect], "{\"tool_name\": \"Bash\"}"), (0, String::new()), "{dialect}");
     }
@@ -1343,6 +1353,11 @@ fn 실행기는_지킴이의_답을_그대로_전하고_답이_없으면_아무�
     assert_eq!(launcher.recorded("stdin"), "{}");
     let launcher = Launcher::new("exit 0");
     assert_eq!(launcher.run(&["--guard", "codex"], "{}"), (0, String::new()));
+    for answer in [format!("case $1 in run) printf '%s' '{deny}'; exit 1 ;; esac"), "case $1 in run) printf 'warning\\n' ;; esac".to_string()] {
+        let launcher = Launcher::new(&answer);
+        assert_eq!(launcher.run(&["--guard", "codex"], "{}"), (0, String::new()), "{answer}");
+        assert!(launcher.recorded("calls").contains("run "), "{answer}");
+    }
 }
 
 #[test]
